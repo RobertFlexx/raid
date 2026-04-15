@@ -17,14 +17,14 @@ raid is that tool. It's rigorous where it counts, and fast because it has to be.
 
 ## How fast?
 
-Fast. On a full system scan of `/`:
+Competitive. On a full system scan of `/` (average of 3 runs):
 
-```
-raid  ~0.48s  (1.38M files found)
-fd    ~0.55s  (1.38M files found)
-```
+| Tool | Time | Files found |
+|------|------|-------------|
+| raid | ~0.45s | ~1,394,000 |
+| fd   | ~0.45s | ~1,391,000 |
 
-raid is typically 10-15% faster, which doesn't matter for occasional use but adds up in scripts running thousands of times a day. The throughput is around 3 million entries per second.
+They're essentially tied on speed. raid finds slightly more files (~3,000 more in this test) due to more rigorous traversal. Your mileage will vary based on filesystem size and hardware.
 
 ## Building
 
