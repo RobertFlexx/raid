@@ -309,23 +309,88 @@ do_install() {
     step "4" "Installing raid..."
 
     local target="${SYSTEM_BIN}/raid"
+    local installed_to=""
 
     if sudo cp "$binary_path" "$target" 2>/dev/null; then
         sudo chmod +x "$target"
+        installed_to="$target"
     elif mkdir -p "$INSTALL_DIR" 2>/dev/null && cp "$binary_path" "${INSTALL_DIR}/raid" 2>/dev/null; then
         target="${INSTALL_DIR}/raid"
         chmod +x "$target"
-
-        if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
-            warn "Add ${INSTALL_DIR} to your PATH"
-        fi
+        installed_to="$target"
     else
         error "Cannot write to installation directories"
         info "Run with sudo or set INSTALL_DIR"
         exit 1
     fi
 
-    success "Installed to $target"
+    success "Installed to $installed_to"
+}
+
+configure_shell() {
+    local install_dir="${1:-${INSTALL_DIR}}"
+
+    step "4" "Configuring shell..."
+
+    local shell_path_export="export PATH=\"${install_dir}:\$PATH\""
+    local current_shell="${SHELL##*/}"
+
+    case "$current_shell" in
+        bash)
+            local bashrc="${HOME}/.bashrc"
+            if ! grep -qF "${install_dir}" "$bashrc" 2>/dev/null; then
+                echo "" >> "$bashrc"
+                echo "$shell_path_export" >> "$bashrc"
+            fi
+            ;;
+        zsh)
+            local zshrc="${HOME}/.zshrc"
+            if ! grep -qF "${install_dir}" "$zshrc" 2>/dev/null; then
+                echo "" >> "$zshrc"
+                echo "$shell_path_export" >> "$zshrc"
+            fi
+            ;;
+        fish)
+            local fish_dir="${HOME}/.config/fish"
+            local fish_conf="${fish_dir}/config.fish"
+            mkdir -p "$fish_dir"
+            if ! grep -qF "${install_dir}" "$fish_conf" 2>/dev/null; then
+                echo "" >> "$fish_conf"
+                echo "set -gx PATH ${install_dir} \$PATH" >> "$fish_conf"
+            fi
+            ;;
+        nu|nushell)
+            local nuconf="${HOME}/.config/nushell/env.nu"
+            mkdir -p "${HOME}/.config/nushell"
+            if ! grep -qF "${install_dir}" "$nuconf" 2>/dev/null; then
+                echo "" >> "$nuconf"
+                echo "\$env.PATH = (\$env.PATH | split row ':' | prepend '${install_dir}')" >> "$nuconf"
+            fi
+            ;;
+        *)
+            for conf in "${HOME}/.bashrc" "${HOME}/.zshrc" "${HOME}/.profile"; do
+                if [[ -f "$conf" ]] && ! grep -qF "${install_dir}" "$conf" 2>/dev/null; then
+                    echo "" >> "$conf"
+                    echo "$shell_path_export" >> "$conf"
+                    break
+                fi
+            done
+            ;;
+    esac
+
+    success "Shell configured for $current_shell"
+}
+
+refresh_shell() {
+    local current_shell="${SHELL##*/}"
+
+    case "$current_shell" in
+        nu|nushell)
+            ;;
+        *)
+            hash -r 2>/dev/null || true
+            ;;
+    esac
 }
 
 main() {
@@ -355,13 +420,29 @@ main() {
 
     do_install "$binary"
 
+    local install_dir_for_shell="${INSTALL_DIR}"
+    if [[ -f "${SYSTEM_BIN}/raid" ]]; then
+        install_dir_for_shell="${SYSTEM_BIN}"
+    fi
+
+    if [[ ":$PATH:" != *":${install_dir_for_shell}:"* ]]; then
+        configure_shell "$install_dir_for_shell"
+    fi
+
     step "5" "Cleaning up..."
     rm -rf "$build_dir"
     success "Done"
 
+    refresh_shell
+
     err ""
     err "${BOLD}All done!${RESET} Run ${GREEN}raid${RESET} to get started."
     err ""
+
+    if [[ ":$PATH:" != *":${install_dir_for_shell}:"* ]]; then
+        err "${DIM}Note: Restart your shell or run:${RESET}"
+        err "${DIM}  source ~/.bashrc${RESET} ${DIM}(or your shell config)${RESET}"
+    fi
 }
 
 main "$@"
