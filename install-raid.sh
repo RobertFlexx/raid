@@ -57,10 +57,6 @@ print_banner() {
     echo -e "  ${DIM}Low-level recursive file system traversal${RESET}"
     echo ""
 }
-    echo -e "${DIM}    Low-level recursive file system traversal${RESET}"
-    echo -e "${DIM}    Installer v${VERSION}${RESET}"
-    echo ""
-}
 
 check_curl() {
     if ! command -v curl &> /dev/null; then
