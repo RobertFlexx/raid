@@ -16,6 +16,13 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
+err() { echo -e "$@" >&2; }
+info() { err "${BLUE}[•]${RESET} $1"; }
+success() { err "${GREEN}[✓]${RESET} $1"; }
+warn() { err "${YELLOW}[!]${RESET} $1"; }
+error() { err "${RED}[✗]${RESET} $1"; }
+step() { err "${CYAN}[${BOLD}$1${RESET}${CYAN}]${RESET} $2"; }
+
 spinner() {
     local pid=$1
     local delay=0.1
@@ -28,66 +35,6 @@ spinner() {
         printf "\b\b\b\b\b\b" >&2
     done
     printf "    \b\b\b\b\b" >&2
-}
-
-log_info() {
-    echo -e "${BLUE}[•]${RESET} $1" >&2
-}
-
-log_success() {
-    echo -e "${GREEN}[✓]${RESET} $1" >&2
-}
-
-log_warn() {
-    echo -e "${YELLOW}[!]${RESET} $1" >&2
-}
-
-log_error() {
-    echo -e "${RED}[✗]${RESET} $1" >&2
-}
-
-log_step() {
-    echo -e "${CYAN}[${BOLD}$1${RESET}${CYAN}]${RESET} $2" >&2
-}
-
-print_banner() {
-    clear >&2
-    echo "" >&2
-    echo -e "  ${BOLD}raid${RESET} ${DIM}v${VERSION}${RESET}" >&2
-    echo -e "  ${DIM}Low-level recursive file system traversal${RESET}" >&2
-    echo "" >&2
-}
-
-check_curl() {
-    if ! command -v curl &> /dev/null; then
-        log_info "Installing curl..."
-        case "$OS" in
-            ubuntu|debian|linuxmint|elementary)
-                sudo apt-get update -qq
-                sudo apt-get install -y curl
-                ;;
-            fedora|rhel|centos|rocky|almalinux)
-                sudo dnf install -y curl
-                ;;
-            arch|manjaro|endeavouros)
-                sudo pacman -S --noconfirm curl
-                ;;
-            opensuse|opensuse-leap|opensuse-tumbleweed)
-                sudo zypper install -y curl
-                ;;
-            alpine)
-                sudo apk add curl
-                ;;
-            macos)
-                if command -v brew &> /dev/null; then
-                    brew install curl
-                else
-                    log_error "Homebrew not found. Please install Homebrew first."
-                    exit 1
-                fi
-                ;;
-        esac
-    fi
 }
 
 detect_os() {
@@ -111,25 +58,59 @@ detect_os() {
     fi
 }
 
+check_curl() {
+    if ! command -v curl &> /dev/null; then
+        info "Installing curl..."
+        case "$OS" in
+            ubuntu|debian|linuxmint|elementary|pop)
+                sudo apt-get update -qq
+                sudo apt-get install -y curl
+                ;;
+            fedora|rhel|centos|rocky|almalinux)
+                sudo dnf install -y curl
+                ;;
+            arch|manjaro|endeavouros)
+                sudo pacman -S --noconfirm curl
+                ;;
+            opensuse|opensuse-leap|opensuse-tumbleweed)
+                sudo zypper install -y curl
+                ;;
+            alpine)
+                sudo apk add curl
+                ;;
+            macos)
+                if command -v brew &> /dev/null; then
+                    brew install curl
+                else
+                    error "Homebrew not found. Please install Homebrew first."
+                    exit 1
+                fi
+                ;;
+        esac
+    fi
+}
+
 install_zig() {
-    log_step "1" "Checking Zig installation..."
+    step "1" "Checking Zig installation..."
 
     if command -v zig &> /dev/null; then
-        local zig_version=$(zig version 2>/dev/null | head -c 4)
-        local major=$(echo "$zig_version" | cut -d. -f1)
-        local minor=$(echo "$zig_version" | cut -d. -f2)
+        local zig_version
+        zig_version=$(zig version 2>/dev/null)
+        local major minor
+        major=$(echo "$zig_version" | cut -d. -f1)
+        minor=$(echo "$zig_version" | cut -d. -f2)
 
         if [[ "$major" -ge 0 && "$minor" -ge 12 ]]; then
-            log_success "Zig $(zig version) already installed"
+            success "Zig $zig_version already installed"
             return 0
         else
-            log_warn "Zig version too old ($(zig version)), need 0.12+"
+            warn "Zig version too old ($zig_version), need 0.12+"
         fi
     else
-        log_info "Zig not found"
+        info "Zig not found"
     fi
 
-    log_step "1" "Installing Zig..."
+    step "1" "Installing Zig..."
 
     case "$OS" in
         ubuntu|debian|linuxmint|elementary|pop)
@@ -137,7 +118,7 @@ install_zig() {
             local apt_source="/etc/apt/sources.list.d/zig.list"
 
             if [[ ! -f "$apt_source" ]]; then
-                log_info "Adding Zig repository..."
+                info "Adding Zig repository..."
                 curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key 2>/dev/null | \
                     sudo tee "$keyring_dir/llvm-snapshot.gpg.key" > /dev/null
                 echo "deb [signed-by=$keyring_dir/llvm-snapshot.gpg.key] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-17 main" | \
@@ -148,7 +129,7 @@ install_zig() {
             sudo apt-get install -y zig
             ;;
 
-        fedora|rhel|centos|rocky|almalinux)
+        fedora|rhel|centos|rocky|almalinux|openmamba)
             if command -v dnf &> /dev/null; then
                 sudo dnf install -y zig
             else
@@ -172,7 +153,7 @@ install_zig() {
             if command -v brew &> /dev/null; then
                 brew install zig
             else
-                log_info "Installing Zig via official installer..."
+                info "Installing Zig via official installer..."
                 local ZIG_VERSION="0.13.0"
                 local ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-macos-x86_64-${ZIG_VERSION}.tar.xz"
 
@@ -189,9 +170,10 @@ install_zig() {
             ;;
 
         *)
-            log_info "Installing Zig via official installer..."
+            info "Installing Zig via official installer..."
             local ZIG_VERSION="0.13.0"
-            local ARCH=$(uname -m)
+            local ARCH
+            ARCH=$(uname -m)
             local ZIG_URL=""
 
             case "$ARCH" in
@@ -202,7 +184,7 @@ install_zig() {
                     ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-linux-aarch64-${ZIG_VERSION}.tar.xz"
                     ;;
                 *)
-                    log_error "Unsupported architecture: $ARCH"
+                    error "Unsupported architecture: $ARCH"
                     exit 1
                     ;;
             esac
@@ -216,15 +198,15 @@ install_zig() {
     esac
 
     if command -v zig &> /dev/null; then
-        log_success "Zig $(zig version) installed"
+        success "Zig $(zig version) installed"
     else
-        log_error "Failed to install Zig"
+        error "Failed to install Zig"
         exit 1
     fi
 }
 
 install_build_deps() {
-    log_step "2" "Checking build dependencies..."
+    step "2" "Checking build dependencies..."
 
     local deps_missing=0
 
@@ -238,93 +220,93 @@ install_build_deps() {
                 fi
             done
             if [[ $deps_missing -eq 1 ]]; then
-                log_info "Installing build dependencies..."
+                info "Installing build dependencies..."
                 sudo apt-get update -qq
                 sudo apt-get install -y build-essential pkg-config libx11-dev
             fi
             ;;
 
-        fedora|rhel|centos|rocky|almalinux)
+        fedora|rhel|centos|rocky|almalinux|openmamba)
             local deps=(gcc make pkgconf-pkg-config libX11-devel)
+            local deps_ok=1
             for dep in "${deps[@]}"; do
                 if ! rpm -q "$dep" &> /dev/null 2>&1; then
-                    deps_missing=1
+                    deps_ok=0
                     break
                 fi
             done
-            if [[ $deps_missing -eq 1 ]]; then
-                log_info "Installing build dependencies..."
-                sudo dnf groupinstall -y "Development Tools"
-                sudo dnf install -y make pkgconf-pkg-config libX11-devel
+            if [[ $deps_ok -eq 0 ]]; then
+                info "Installing build dependencies..."
+                sudo dnf install -y gcc make pkgconf-pkg-config libX11-devel || true
             fi
             ;;
 
         arch|manjaro|endeavouros)
             if ! pacman -Q base-devel &> /dev/null 2>&1; then
-                log_info "Installing build dependencies..."
+                info "Installing build dependencies..."
                 sudo pacman -S --noconfirm base-devel
             fi
             ;;
 
         opensuse|opensuse-leap|opensuse-tumbleweed)
             if ! rpm -q patterns-devel-base-devel_basis &> /dev/null 2>&1; then
-                log_info "Installing build dependencies..."
+                info "Installing build dependencies..."
                 sudo zypper install -y -t pattern devel_basis
             fi
             ;;
 
         alpine)
             if ! apk info libc-dev &> /dev/null 2>&1; then
-                log_info "Installing build dependencies..."
+                info "Installing build dependencies..."
                 sudo apk add build-base
             fi
             ;;
     esac
 
-    log_success "Build dependencies ready"
+    success "Build dependencies ready"
 }
 
-clone_and_build() {
-    log_step "3" "Cloning raid repository..."
+do_build() {
+    local build_dir="$1"
 
-    local build_dir="/tmp/raid-build-$$"
+    step "3" "Cloning raid repository..."
 
-    if [[ -d "/tmp/raid-build-$$" ]]; then
+    if [[ -d "$build_dir" ]]; then
         rm -rf "$build_dir"
     fi
 
     mkdir -p "$build_dir"
-    git clone --depth 1 "https://github.com/${REPO}.git" "$build_dir" > /dev/null 2>&1
+    git clone --depth 1 "https://github.com/${REPO}.git" "$build_dir" 2>/dev/null
 
-    log_success "Repository cloned"
+    success "Repository cloned"
 
-    log_step "3" "Building raid..."
+    step "3" "Building raid..."
 
     local zig_path=""
     if [[ -d "/usr/local/zig" ]]; then
         zig_path="/usr/local/zig"
     fi
 
-    (cd "$build_dir" && PATH="${zig_path}:${PATH}" zig build-exe -lc -O ReleaseFast raid.zig) &
+    (
+        cd "$build_dir" || exit 1
+        PATH="${zig_path}:${PATH}" zig build-exe -lc -O ReleaseFast raid.zig
+    ) &
     local build_pid=$!
     spinner $build_pid
     wait $build_pid
 
     if [[ $? -ne 0 ]]; then
-        log_error "Build failed"
-        rm -rf "$build_dir"
-        exit 1
+        error "Build failed"
+        return 1
     fi
 
-    log_success "Build complete"
-
-    echo "$build_dir/raid"
+    success "Build complete"
 }
 
-install_binary() {
+do_install() {
     local binary_path="$1"
 
-    log_step "4" "Installing raid..."
+    step "4" "Installing raid..."
 
     local target="${SYSTEM_BIN}/raid"
 
@@ -337,55 +319,51 @@ install_binary() {
         chmod +x "$target"
 
         if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
-            log_warn "Add ${INSTALL_DIR} to your PATH"
+            warn "Add ${INSTALL_DIR} to your PATH"
         fi
     else
-        log_error "Cannot write to installation directories"
-        log_info "Run with sudo or set INSTALL_DIR"
+        error "Cannot write to installation directories"
+        info "Run with sudo or set INSTALL_DIR"
         exit 1
     fi
 
-    log_success "Installed to $target"
-
-    if ! command -v raid &> /dev/null; then
-        echo ""
-        log_warn "raid not found in PATH. Add to your shell config:"
-        if [[ "$target" == "${SYSTEM_BIN}/raid" ]]; then
-            echo -e "${DIM}    export PATH=\"${SYSTEM_BIN}:\$PATH\"${RESET}"
-        else
-            echo -e "${DIM}    export PATH=\"${INSTALL_DIR}:\$PATH\"${RESET}"
-        fi
-    fi
-}
-
-cleanup() {
-    log_step "5" "Cleaning up..."
-    rm -rf /tmp/raid-build-$$
-    log_success "Done"
+    success "Installed to $target"
 }
 
 main() {
-    print_banner
+    err ""
+    err "  ${BOLD}raid${RESET} ${DIM}v${VERSION}${RESET}"
+    err "  ${DIM}Low-level recursive file system traversal${RESET}"
+    err ""
 
-    log_info "Detecting system..."
+    info "Detecting system..."
     detect_os
-    echo -e "    ${BOLD}${OS_NAME}${RESET} ${DIM}${OS_VERSION}${RESET}"
-    echo ""
+    err "    ${BOLD}${OS_NAME}${RESET} ${DIM}${OS_VERSION}${RESET}"
+    err ""
 
     check_curl
     install_zig
     install_build_deps
 
-    local binary_path
-    binary_path=$(clone_and_build)
-    install_binary "$binary_path"
+    local build_dir="/tmp/raid-build-$$"
+    do_build "$build_dir"
 
-    cleanup
+    local binary="${build_dir}/raid"
+    if [[ ! -f "$binary" ]]; then
+        error "Binary not found at $binary"
+        rm -rf "$build_dir"
+        exit 1
+    fi
 
-    echo ""
-    echo -e "${BOLD}All done!${RESET} Run ${GREEN}raid${RESET} to get started."
-    echo ""
-    raid --version 2>/dev/null || true
+    do_install "$binary"
+
+    step "5" "Cleaning up..."
+    rm -rf "$build_dir"
+    success "Done"
+
+    err ""
+    err "${BOLD}All done!${RESET} Run ${GREEN}raid${RESET} to get started."
+    err ""
 }
 
 main "$@"
