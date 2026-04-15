@@ -31,31 +31,31 @@ spinner() {
 }
 
 log_info() {
-    echo -e "${BLUE}[•]${RESET} $1"
+    echo -e "${BLUE}[•]${RESET} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}[✓]${RESET} $1"
+    echo -e "${GREEN}[✓]${RESET} $1" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}[!]${RESET} $1"
+    echo -e "${YELLOW}[!]${RESET} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[✗]${RESET} $1"
+    echo -e "${RED}[✗]${RESET} $1" >&2
 }
 
 log_step() {
-    echo -e "${CYAN}[${BOLD}$1${RESET}${CYAN}]${RESET} $2"
+    echo -e "${CYAN}[${BOLD}$1${RESET}${CYAN}]${RESET} $2" >&2
 }
 
 print_banner() {
-    clear
-    echo ""
-    echo -e "  ${BOLD}raid${RESET} ${DIM}v${VERSION}${RESET}"
-    echo -e "  ${DIM}Low-level recursive file system traversal${RESET}"
-    echo ""
+    clear >&2
+    echo "" >&2
+    echo -e "  ${BOLD}raid${RESET} ${DIM}v${VERSION}${RESET}" >&2
+    echo -e "  ${DIM}Low-level recursive file system traversal${RESET}" >&2
+    echo "" >&2
 }
 
 check_curl() {
@@ -294,11 +294,7 @@ clone_and_build() {
     fi
 
     mkdir -p "$build_dir"
-    git clone --depth 1 "https://github.com/${REPO}.git" "$build_dir" 2>&1 | \
-        while IFS= read -r line; do
-            printf "\r    %s" "$line"
-        done
-    echo ""
+    git clone --depth 1 "https://github.com/${REPO}.git" "$build_dir" > /dev/null 2>&1
 
     log_success "Repository cloned"
 
