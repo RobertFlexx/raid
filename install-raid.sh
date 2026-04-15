@@ -310,12 +310,10 @@ do_install() {
 
     local target="${SYSTEM_BIN}/raid"
 
-    if [[ -w "$SYSTEM_BIN" ]]; then
-        sudo cp "$binary_path" "$target"
+    if sudo cp "$binary_path" "$target" 2>/dev/null; then
         sudo chmod +x "$target"
-    elif [[ -w "$HOME/.local/bin" ]] || mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+    elif mkdir -p "$INSTALL_DIR" 2>/dev/null && cp "$binary_path" "${INSTALL_DIR}/raid" 2>/dev/null; then
         target="${INSTALL_DIR}/raid"
-        cp "$binary_path" "$target"
         chmod +x "$target"
 
         if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
