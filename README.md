@@ -26,11 +26,13 @@ Competitive. On a full system scan of `/` (average of 3 runs):
 
 They're essentially tied on speed. raid finds slightly more files (~3,000 more in this test) due to more rigorous traversal. **Your mileage will vary based on filesystem size and hardware!!**
 
-## Building
+## Installing
 
 ```bash
-zig build-exe -lc -O ReleaseFast raid.zig
+curl -sSL https://raw.githubusercontent.com/RobertFlexx/raid/main/install-raid.sh | bash
 ```
+
+This will auto-detect your distro, install Zig if needed, and build raid from source.
 
 You'll need Zig 0.12+ and a Linux system. The `-lc` links against libc, which is required for directory traversal syscalls.
 
