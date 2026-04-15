@@ -24,7 +24,7 @@ Competitive. On a full system scan of `/` (average of 3 runs):
 | raid | ~0.45s | ~1,394,000 |
 | fd   | ~0.45s | ~1,391,000 |
 
-They're essentially tied on speed. raid finds slightly more files (~3,000 more in this test) due to more rigorous traversal. Your mileage will vary based on filesystem size and hardware.
+They're essentially tied on speed. raid finds slightly more files (~3,000 more in this test) due to more rigorous traversal. **Your mileage will vary based on filesystem size and hardware!!**
 
 ## Building
 
