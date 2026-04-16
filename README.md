@@ -15,6 +15,14 @@ Most file finders optimize for the common case and cut corners elsewhere. That's
 
 raid is that tool. It's rigorous where it counts, and fast because it has to be.
 
+## How to build
+
+
+```bash
+zig build-exe raid.zig -O ReleaseFast -lc -fstrip
+```
+
+
 ## How fast?
 
 Competitive. On a full system scan of `/` (average of 3 runs):
