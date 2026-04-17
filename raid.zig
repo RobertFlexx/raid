@@ -31,6 +31,7 @@ const c_io = struct {
 };
 
 var interrupted: bool = false;
+var global_io: std.Io = undefined;
 
 fn setSignalHandler() void {
     const handler_fn = struct {
@@ -64,8 +65,8 @@ const DT_FIFO: u8 = 1;
 const DT_SOCK: u8 = 12;
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
-const Condition = std.Thread.Condition;
+const Mutex = std.Io.Mutex;
+const Condition = std.Io.Condition;
 const AtomicU64 = std.atomic.Value(u64);
 
 const WalkMode = enum {
@@ -155,14 +156,14 @@ const TaskQueue = struct {
     queued: usize = 0,
     pending_dirs: usize = 0,
     done: bool = false,
-    mu: Mutex = .{},
-    cv: Condition = .{},
+    mu: Mutex = .init,
+    cv: Condition = .init,
 
     fn push(self: *TaskQueue, task: *Task) void {
         task.next = null;
         task.prev = null;
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
         task.prev = self.tail;
         if (self.tail) |tail| {
             tail.next = task;
@@ -172,14 +173,14 @@ const TaskQueue = struct {
         self.tail = task;
         self.queued += 1;
         self.pending_dirs += 1;
-        self.cv.signal();
+        self.cv.signal(global_io);
     }
 
     fn pop(self: *TaskQueue, mode: WalkMode) ?*Task {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
         while (!self.done and self.head == null) {
-            self.cv.wait(&self.mu);
+            self.cv.wait(global_io, &self.mu) catch unreachable;
         }
         if (self.head == null) return null;
 
@@ -203,34 +204,34 @@ const TaskQueue = struct {
     }
 
     fn taskDone(self: *TaskQueue) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
         if (self.pending_dirs > 0) self.pending_dirs -= 1;
         if (self.pending_dirs == 0 and self.queued == 0) {
             self.done = true;
-            self.cv.broadcast();
+            self.cv.broadcast(global_io);
         }
     }
 
     fn finalizeIfIdle(self: *TaskQueue) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
         if (self.pending_dirs == 0 and self.queued == 0) {
             self.done = true;
-            self.cv.broadcast();
+            self.cv.broadcast(global_io);
         }
     }
 
     fn abort(self: *TaskQueue) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
         self.done = true;
-        self.cv.broadcast();
+        self.cv.broadcast(global_io);
     }
 };
 
 const Output = struct {
-    mu: Mutex = .{},
+    mu: Mutex = .init,
     use_lock: bool = false,
 };
 
@@ -359,8 +360,8 @@ fn noteMatch(stats: *Stats) void {
 }
 
 fn outputPath(out: *Output, opt: *const Options, path: []const u8) void {
-    if (out.use_lock) out.mu.lock();
-    defer if (out.use_lock) out.mu.unlock();
+    if (out.use_lock) out.mu.lock(global_io) catch unreachable;
+    defer if (out.use_lock) out.mu.unlock(global_io);
     _ = c.fwrite(path.ptr, 1, path.len, c.stdout);
     _ = c.fputc(if (opt.print0) 0 else '\n', c.stdout);
 }
@@ -593,11 +594,11 @@ fn autodetectThreads() i32 {
     return @as(i32, @intCast(n));
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     setSignalHandler();
-    const allocator = std.heap.c_allocator;
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const allocator = init.arena.allocator();
+    global_io = init.io;
+    const args = try init.minimal.args.toSlice(allocator);
 
     if (args.len == 0) return;
     const progname = args[0];

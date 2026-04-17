@@ -9,6 +9,7 @@ raid is a file finder that does one thing well: traverse directories and find fi
 The name comes from thinking of directories as a raid structure to explore - not the most creative, but it stuck.
 
 > and yes, raid works well on RAID storage devices. youre welcome.
+
 ## Why?
 
 Most file finders optimize for the common case and cut corners elsewhere. That's fine for 99% of uses, but sometimes you need something that doesn't skip hidden files by default, doesn't ignore permission errors silently, and doesn't make assumptions about what you actually asked for.
@@ -17,20 +18,30 @@ raid is that tool. It's rigorous where it counts, and fast because it has to be.
 
 ## How to build
 
-
 ```bash
 zig build-exe raid.zig -O ReleaseFast -lc -fstrip
 ```
 
+### Zig version note
+
+raid now targets **Zig 0.16+**.
+
+Zig 0.16 introduced breaking changes to:
+
+* process argument handling (`std.process.Init`)
+* synchronization primitives (`std.Io.Mutex`, `std.Io.Condition`)
+
+If you're building with an older Zig version, it will not compile without modification.
+Use Zig 0.16 or newer, then compile this.
 
 ## How fast?
 
 Competitive. On a full system scan of `/` (average of 3 runs):
 
-| Tool | Time | Files found |
-|------|------|-------------|
-| raid | ~0.45s | ~1,394,000 |
-| fd   | ~0.45s | ~1,391,000 |
+| Tool | Time   | Files found |
+| ---- | ------ | ----------- |
+| raid | ~0.45s | ~1,394,000  |
+| fd   | ~0.45s | ~1,391,000  |
 
 They're essentially tied on speed. raid finds slightly more files (~3,000 more in this test) due to more rigorous traversal. **Your mileage will vary based on filesystem size and hardware!!**
 
@@ -97,17 +108,17 @@ Compatible with `find` for the most part.
 
 ## Design notes
 
-- Single-threaded by default, but uses multiple workers when `-j N` is specified
-- Uses BFS by default (breadth-first), switch to DFS with `-walk dfs` if you prefer
-- Permission errors are reported but don't stop traversal
-- Symlinks are followed to their target for type detection, not traversed
-- The traversal is exhaustive - it won't skip directories due to heuristics
+* Single-threaded by default, but uses multiple workers when `-j N` is specified
+* Uses BFS by default (breadth-first), switch to DFS with `-walk dfs` if you prefer
+* Permission errors are reported but don't stop traversal
+* Symlinks are followed to their target for type detection, not traversed
+* The traversal is exhaustive - it won't skip directories due to heuristics
 
 ## Compared to other tools
 
-- **fd**: Slightly faster, more features (colored output, regex, etc)
-- **find**: More portable, slower, different filter syntax
-- **locate**: Instant but requires database, misses recent files
+* **fd**: Slightly faster, more features (colored output, regex, etc)
+* **find**: More portable, slower, different filter syntax
+* **locate**: Instant but requires database, misses recent files
 
 Pick the right tool for the job. raid is great when you need speed and correctness over features.
 
