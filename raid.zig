@@ -56,6 +56,8 @@ const c = @cImport({
     @cInclude("dirent.h");
 });
 
+extern "c" fn posix_fadvise(fd: c_int, offset: c.off_t, len: c.off_t, advice: c_int) c_int;
+
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
@@ -74,13 +76,22 @@ const WalkMode = enum {
     dfs,
 };
 
+const StorageMode = enum {
+    auto,
+    hdd,
+    ssd,
+    raid,
+};
+
 const Options = struct {
-    name_pat: ?[]u8 = null,
-    path_pat: ?[]u8 = null,
-    exclude_pat: ?[]u8 = null,
-    exclude_path_pat: ?[]u8 = null,
-    prune_pat: ?[]u8 = null,
-    prune_path_pat: ?[]u8 = null,
+    name_pat: ?[]const u8 = null,
+    path_pat: ?[]const u8 = null,
+    exclude_pat: ?[]const u8 = null,
+    exclude_path_pat: ?[]const u8 = null,
+    prune_pat: ?[]const u8 = null,
+    prune_path_pat: ?[]const u8 = null,
+    ext_pat: ?[]const u8 = null,
+    contains_pat: ?[]const u8 = null,
     mindepth: i32 = 0,
     maxdepth: i32 = std.math.maxInt(i32),
     type_filter: u8 = 0,
@@ -98,12 +109,15 @@ const Options = struct {
     print0: bool = false,
     quiet_errors: bool = false,
     stats: bool = false,
+    limit: u64 = 0,
     timing: bool = false,
     xdev: bool = false,
     skip_vfs: bool = false,
     noprint: bool = false,
     hidden: bool = false,
     walk_mode: WalkMode = .bfs,
+    walk_set: bool = false,
+    storage_mode: StorageMode = .auto,
 };
 
 const Timing = struct {
@@ -182,6 +196,7 @@ const TaskQueue = struct {
         while (!self.done and self.head == null) {
             self.cv.wait(global_io, &self.mu) catch unreachable;
         }
+        if (self.done) return null;
         if (self.head == null) return null;
 
         var task: *Task = undefined;
@@ -267,6 +282,8 @@ fn usage(progname: []const u8) void {
             "  -exclude-path PAT     exclude full paths from matching\n" ++
             "  -prune PAT            prune basenames from descent\n" ++
             "  -prune-path PAT       prune full paths from descent\n" ++
+            "  -ext EXT              match file extension (dot optional)\n" ++
+            "  -contains TEXT        match paths containing literal text\n" ++
             "  -type C               file type: f d l b c p s\n" ++
             "  -uid N                exact uid filter\n" ++
             "  -gid N                exact gid filter\n" ++
@@ -280,9 +297,12 @@ fn usage(progname: []const u8) void {
             "  -skip-vfs             prune /proc /sys /dev /run when traversing /\n" ++
             "  -H, --hidden          include hidden files\n" ++
             "  -walk bfs|dfs         traversal queue mode\n" ++
-            "  -j N                  worker threads (default: all cores)\n" ++
+            "  -storage auto|hdd|ssd|raid\n" ++
+            "                         tune default workers and walk order\n" ++
+            "  -j N                  worker threads (default: storage-tuned)\n" ++
             "  -0, -print0           NUL-delimited output\n" ++
             "  -noprint              do not emit matches\n" ++
+            "  -limit N              stop after N matches\n" ++
             "  -q, -quiet            suppress traversal errors\n" ++
             "  -stats                print counters to stderr\n" ++
             "  -time                 print timing info\n" ++
@@ -359,6 +379,34 @@ fn noteMatch(stats: *Stats) void {
     _ = stats.matched.fetchAdd(1, .monotonic);
 }
 
+fn recordMatch(ctx: *WorkerCtx) bool {
+    if (ctx.opt.limit == 0) {
+        if (ctx.opt.stats) noteMatch(ctx.stats);
+        return true;
+    }
+
+    const old = ctx.stats.matched.fetchAdd(1, .monotonic);
+    if (old >= ctx.opt.limit) return false;
+    if (old + 1 >= ctx.opt.limit) ctx.queue.abort();
+    return true;
+}
+
+fn recordRootMatch(opt: *const Options, queue: *TaskQueue, stats: *Stats) bool {
+    if (opt.limit == 0) {
+        if (opt.stats) noteMatch(stats);
+        return true;
+    }
+
+    const old = stats.matched.fetchAdd(1, .monotonic);
+    if (old >= opt.limit) return false;
+    if (old + 1 >= opt.limit) queue.abort();
+    return true;
+}
+
+fn limitReached(opt: *const Options, stats: *Stats) bool {
+    return opt.limit != 0 and stats.matched.load(.monotonic) >= opt.limit;
+}
+
 fn outputPath(out: *Output, opt: *const Options, path: []const u8) void {
     if (out.use_lock) out.mu.lock(global_io) catch unreachable;
     defer if (out.use_lock) out.mu.unlock(global_io);
@@ -389,6 +437,14 @@ fn fnmatchOk(patz: ?[]const u8, zstr: [*:0]const u8) bool {
     return c.fnmatch(pptr, zstr, 0) == 0;
 }
 
+fn extMatches(base: []const u8, ext: []const u8) bool {
+    const needle = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
+    if (needle.len == 0) return false;
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= base.len) return false;
+    return std.mem.eql(u8, base[dot + 1 ..], needle);
+}
+
 fn matchesFiltersZ(opt: *const Options, pathz: []u8, st: ?*const c.struct_stat, type_char: u8, depth: i32) bool {
     if (depth < opt.mindepth or depth > opt.maxdepth) return false;
 
@@ -402,6 +458,12 @@ fn matchesFiltersZ(opt: *const Options, pathz: []u8, st: ?*const c.struct_stat, 
 
     if (opt.name_pat != null and !fnmatchOk(opt.name_pat, base_ptr)) return false;
     if (opt.path_pat != null and !fnmatchOk(opt.path_pat, path_ptr)) return false;
+    if (opt.ext_pat) |ext| {
+        if (!extMatches(baseName(pathSlice(pathz)), ext)) return false;
+    }
+    if (opt.contains_pat) |needle| {
+        if (std.mem.indexOf(u8, pathSlice(pathz), needle) == null) return false;
+    }
 
     if (opt.uid_set or opt.gid_set or opt.inode_set or opt.perm_set or opt.newer_set) {
         if (st == null) return false;
@@ -463,15 +525,25 @@ fn needStatForEntry(opt: *const Options, type_char: u8) bool {
     return false;
 }
 
+fn openDirZ(zpath: [*:0]const u8) c_int {
+    const flags = c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC;
+    if (comptime @hasDecl(c, "O_NOATIME")) {
+        const fd = c.open(zpath, flags | c.O_NOATIME);
+        if (fd >= 0) return fd;
+    }
+    return c.open(zpath, flags);
+}
+
 fn processDirectory(ctx: *WorkerCtx, task: *Task) void {
     const pathz = task.pathz;
     const path = pathSlice(pathz);
     const zpath: [*:0]const u8 = @ptrCast(pathz.ptr);
-    const fd = c.open(zpath, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
+    const fd = openDirZ(zpath);
     if (fd < 0) {
         reportError(ctx, path);
         return;
     }
+    _ = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
     const hidden = ctx.opt.hidden;
     const skip_vfs = ctx.opt.skip_vfs;
@@ -535,11 +607,14 @@ fn processDirectory(ctx: *WorkerCtx, task: *Task) void {
             if (type_char == '?') type_char = fileTypeCharFromMode(st.st_mode);
         }
 
-        noteType(ctx.stats, type_char);
+        if (ctx.opt.stats) noteType(ctx.stats, type_char);
 
         if (matchesFiltersZ(ctx.opt, child_pathz, if (have_stat) &st else null, type_char, child_depth)) {
-            noteMatch(ctx.stats);
-            if (!ctx.opt.noprint) outputPath(ctx.out, ctx.opt, child_path);
+            if (recordMatch(ctx) and !ctx.opt.noprint) outputPath(ctx.out, ctx.opt, child_path);
+            if (limitReached(ctx.opt, ctx.stats)) {
+                ctx.allocator.free(child_pathz);
+                break;
+            }
         }
 
         if (type_char == 'd' and child_depth < ctx.opt.maxdepth) {
@@ -568,7 +643,7 @@ fn processDirectory(ctx: *WorkerCtx, task: *Task) void {
                     .prev = null,
                 };
                 ctx.queue.push(next);
-                _ = ctx.stats.dirs_enqueued.fetchAdd(1, .monotonic);
+                if (ctx.opt.stats) _ = ctx.stats.dirs_enqueued.fetchAdd(1, .monotonic);
                 continue;
             }
         }
@@ -592,6 +667,36 @@ fn autodetectThreads() i32 {
     if (n < 1) return 1;
     if (n > 64) return 64;
     return @as(i32, @intCast(n));
+}
+
+fn storageName(mode: StorageMode) []const u8 {
+    return switch (mode) {
+        .auto => "auto",
+        .hdd => "hdd",
+        .ssd => "ssd",
+        .raid => "raid",
+    };
+}
+
+fn parseStorageMode(s: []const u8) ?StorageMode {
+    if (std.ascii.eqlIgnoreCase(s, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(s, "hdd")) return .hdd;
+    if (std.ascii.eqlIgnoreCase(s, "ssd")) return .ssd;
+    if (std.ascii.eqlIgnoreCase(s, "raid")) return .raid;
+    return null;
+}
+
+fn storageDefaultThreads(mode: StorageMode) i32 {
+    const cores = autodetectThreads();
+    return switch (mode) {
+        .hdd => if (cores > 2) 2 else cores,
+        .auto, .ssd, .raid => cores,
+    };
+}
+
+fn applyStorageDefaults(opt: *Options) void {
+    if (opt.storage_mode == .hdd and !opt.walk_set) opt.walk_mode = .dfs;
+    if (opt.threads == 0) opt.threads = storageDefaultThreads(opt.storage_mode);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -656,6 +761,20 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             }
             opt.prune_path_pat = try dupeZ(allocator, args[i]);
+        } else if (std.mem.eql(u8, arg, "-ext") or std.mem.eql(u8, arg, "-extension")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("{s}: missing argument for -ext\n", .{progname});
+                std.process.exit(2);
+            }
+            opt.ext_pat = args[i];
+        } else if (std.mem.eql(u8, arg, "-contains")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("{s}: missing argument for -contains\n", .{progname});
+                std.process.exit(2);
+            }
+            opt.contains_pat = args[i];
         } else if (std.mem.eql(u8, arg, "-type")) {
             i += 1;
             if (i >= args.len or args[i].len != 1 or std.mem.indexOfScalar(u8, "fdlbcps", args[i][0]) == null) {
@@ -725,6 +844,10 @@ pub fn main(init: std.process.Init) !void {
             opt.print0 = true;
         } else if (std.mem.eql(u8, arg, "-noprint")) {
             opt.noprint = true;
+        } else if (std.mem.eql(u8, arg, "-limit")) {
+            i += 1;
+            if (i >= args.len) std.process.exit(2);
+            opt.limit = try parseInt(u64, args[i]);
         } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "-quiet")) {
             opt.quiet_errors = true;
         } else if (std.mem.eql(u8, arg, "-stats")) {
@@ -735,6 +858,14 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) std.process.exit(2);
             if (std.ascii.eqlIgnoreCase(args[i], "bfs")) opt.walk_mode = .bfs else if (std.ascii.eqlIgnoreCase(args[i], "dfs")) opt.walk_mode = .dfs else std.process.exit(2);
+            opt.walk_set = true;
+        } else if (std.mem.eql(u8, arg, "-storage") or std.mem.eql(u8, arg, "--storage")) {
+            i += 1;
+            if (i >= args.len) std.process.exit(2);
+            opt.storage_mode = parseStorageMode(args[i]) orelse {
+                std.debug.print("{s}: invalid -storage (use auto, hdd, ssd, or raid)\n", .{progname});
+                std.process.exit(2);
+            };
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             usage(progname);
             return;
@@ -752,7 +883,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (roots.items.len == 0) try roots.append(allocator, ".");
     if (opt.mindepth > opt.maxdepth) std.process.exit(2);
-    if (opt.threads == 0) opt.threads = autodetectThreads();
+    applyStorageDefaults(&opt);
 
     _ = c.setvbuf(c.stdout, null, c._IOFBF, 1024 * 1024);
 
@@ -790,14 +921,13 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const type_char = fileTypeCharFromMode(st.st_mode);
-        noteType(&stats, type_char);
+        if (opt.stats) noteType(&stats, type_char);
 
         if (matchesFiltersZ(&opt, rootz, &st, type_char, 0)) {
-            noteMatch(&stats);
-            if (!opt.noprint) outputPath(&out, &opt, root);
+            if (recordRootMatch(&opt, &queue, &stats) and !opt.noprint) outputPath(&out, &opt, root);
         }
 
-        if (type_char == 'd' and opt.maxdepth > 0) {
+        if (type_char == 'd' and opt.maxdepth > 0 and !limitReached(&opt, &stats)) {
             const task = try allocator.create(Task);
             task.* = .{
                 .pathz = rootz,
@@ -807,7 +937,7 @@ pub fn main(init: std.process.Init) !void {
                 .prev = null,
             };
             queue.push(task);
-            _ = stats.dirs_enqueued.fetchAdd(1, .monotonic);
+            if (opt.stats) _ = stats.dirs_enqueued.fetchAdd(1, .monotonic);
         } else {
             allocator.free(rootz);
         }
@@ -842,7 +972,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (opt.stats) {
         std.debug.print(
-            "matched={} files={} dirs={} links={} others={} queued_dirs={} errors={} threads={} walk={s}\n",
+            "matched={} files={} dirs={} links={} others={} queued_dirs={} errors={} threads={} walk={s} storage={s}\n",
             .{
                 stats.matched.load(.monotonic),
                 stats.files_seen.load(.monotonic),
@@ -853,6 +983,7 @@ pub fn main(init: std.process.Init) !void {
                 stats.errors.load(.monotonic),
                 opt.threads,
                 if (opt.walk_mode == .bfs) "bfs" else "dfs",
+                storageName(opt.storage_mode),
             },
         );
     }
