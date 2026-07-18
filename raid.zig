@@ -1,75 +1,45 @@
 const std = @import("std");
 
-const CLOCK_MONOTONIC = 1;
-const CLOCK_PROCESS_CPUTIME_ID = 2;
+const c = @cImport({
+    @cInclude("errno.h");
+    @cInclude("fcntl.h");
+    @cInclude("signal.h");
+    @cInclude("stdio.h");
+    @cInclude("stdlib.h");
+    @cInclude("string.h");
+    @cInclude("sys/stat.h");
+    @cInclude("sys/syscall.h");
+    @cInclude("sys/types.h");
+    @cInclude("time.h");
+    @cInclude("unistd.h");
+});
+
+const Allocator = std.mem.Allocator;
+const AtomicBool = std.atomic.Value(bool);
+const AtomicU64 = std.atomic.Value(u64);
+const Mutex = std.Io.Mutex;
+const Condition = std.Io.Condition;
+
+const VERSION = "2.0.0";
+const READ_BUFFER_SIZE = 128 * 1024;
+const OUTPUT_FLUSH_THRESHOLD = 128 * 1024;
+const TASK_BATCH_SIZE = 64;
+
+var global_io: std.Io = undefined;
+var signal_seen: c.sig_atomic_t = 0;
 
 const Timespec = extern struct {
     tv_sec: i64,
     tv_nsec: i64,
 };
 
-const c_clock = struct {
-    extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-};
-
-extern "c" fn readdir(dirp: ?*anyopaque) ?*anyopaque;
-extern "c" fn fdopendir(fd: c_int) ?*anyopaque;
-extern "c" fn closedir(dirp: ?*anyopaque) c_int;
-
-const DIRENT = extern struct {
-    d_ino: c.ino_t,
-    d_off: c.off_t,
+const LinuxDirent64 = extern struct {
+    d_ino: u64,
+    d_off: i64,
     d_reclen: u16,
     d_type: u8,
     d_name: [0]u8,
 };
-
-const POSIX_FADV_SEQUENTIAL = 2;
-
-const c_io = struct {
-    extern "c" fn signal(sig: c_int, handler: *anyopaque) *anyopaque;
-};
-
-var interrupted: bool = false;
-var global_io: std.Io = undefined;
-
-fn setSignalHandler() void {
-    const handler_fn = struct {
-        fn f(sig: c_int) void {
-            _ = sig;
-            interrupted = true;
-        }
-    }.f;
-    _ = c_io.signal(2, @as(*anyopaque, @ptrFromInt(@intFromPtr(&handler_fn))));
-}
-
-const c = @cImport({
-    @cInclude("errno.h");
-    @cInclude("fcntl.h");
-    @cInclude("fnmatch.h");
-    @cInclude("stdio.h");
-    @cInclude("stdlib.h");
-    @cInclude("string.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/types.h");
-    @cInclude("unistd.h");
-    @cInclude("dirent.h");
-});
-
-extern "c" fn posix_fadvise(fd: c_int, offset: c.off_t, len: c.off_t, advice: c_int) c_int;
-
-const DT_DIR: u8 = 4;
-const DT_REG: u8 = 8;
-const DT_LNK: u8 = 10;
-const DT_BLK: u8 = 6;
-const DT_CHR: u8 = 2;
-const DT_FIFO: u8 = 1;
-const DT_SOCK: u8 = 12;
-
-const Allocator = std.mem.Allocator;
-const Mutex = std.Io.Mutex;
-const Condition = std.Io.Condition;
-const AtomicU64 = std.atomic.Value(u64);
 
 const WalkMode = enum {
     bfs,
@@ -80,21 +50,36 @@ const StorageMode = enum {
     auto,
     hdd,
     ssd,
-    raid,
+};
+
+const CaseMode = enum {
+    smart,
+    sensitive,
+    insensitive,
+};
+
+const ColorMode = enum {
+    auto,
+    always,
+    never,
 };
 
 const Options = struct {
-    name_pat: ?[]const u8 = null,
-    path_pat: ?[]const u8 = null,
-    exclude_pat: ?[]const u8 = null,
-    exclude_path_pat: ?[]const u8 = null,
-    prune_pat: ?[]const u8 = null,
-    prune_path_pat: ?[]const u8 = null,
-    ext_pat: ?[]const u8 = null,
-    contains_pat: ?[]const u8 = null,
-    mindepth: i32 = 0,
-    maxdepth: i32 = std.math.maxInt(i32),
-    type_filter: u8 = 0,
+    pattern: ?[]const u8 = null,
+    glob: bool = false,
+    full_path: bool = false,
+    case_mode: CaseMode = .smart,
+
+    extensions: []const []const u8 = &.{},
+    excludes: []const []const u8 = &.{},
+    prunes: []const []const u8 = &.{},
+
+    min_depth: i32 = 0,
+    max_depth: i32 = std.math.maxInt(i32),
+    type_mask: u16 = 0,
+    executable_only: bool = false,
+    empty_only: bool = false,
+
     uid: c.uid_t = 0,
     gid: c.gid_t = 0,
     inode: c.ino_t = 0,
@@ -103,18 +88,33 @@ const Options = struct {
     gid_set: bool = false,
     inode_set: bool = false,
     perm_set: bool = false,
-    newer: Timespec = std.mem.zeroes(Timespec),
-    newer_set: bool = false,
+
+    size_min: ?u64 = null,
+    size_max: ?u64 = null,
+    newer_than: ?Timespec = null,
+    age_max_ns: ?u64 = null,
+    age_min_ns: ?u64 = null,
+
     threads: i32 = 0,
-    print0: bool = false,
-    quiet_errors: bool = false,
-    stats: bool = false,
-    limit: u64 = 0,
-    timing: bool = false,
+    hidden: bool = false,
     xdev: bool = false,
     skip_vfs: bool = false,
+    strip_dot_slash: bool = true,
+    absolute: bool = false,
+
+    print0: bool = false,
     noprint: bool = false,
-    hidden: bool = false,
+    quiet_errors: bool = false,
+    stats: bool = false,
+    timing: bool = false,
+    long: bool = false,
+    human_readable: bool = false,
+    classify: bool = false,
+    limit: u64 = 0,
+
+    color_mode: ColorMode = .auto,
+    use_color: bool = false,
+
     walk_mode: WalkMode = .bfs,
     walk_set: bool = false,
     storage_mode: StorageMode = .auto,
@@ -126,35 +126,42 @@ const Timing = struct {
     cpu_start: Timespec,
     cpu_end: Timespec,
 
-    fn captureStart() Timing {
-        var t: Timing = undefined;
-        _ = c_clock.clock_gettime(CLOCK_MONOTONIC, &t.real_start);
-        _ = c_clock.clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t.cpu_start);
-        t.real_end = std.mem.zeroes(Timespec);
-        t.cpu_end = std.mem.zeroes(Timespec);
-        return t;
+    fn start() Timing {
+        var out: Timing = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, @ptrCast(&out.real_start));
+        _ = c.clock_gettime(c.CLOCK_PROCESS_CPUTIME_ID, @ptrCast(&out.cpu_start));
+        out.real_end = .{ .tv_sec = 0, .tv_nsec = 0 };
+        out.cpu_end = .{ .tv_sec = 0, .tv_nsec = 0 };
+        return out;
     }
 
-    fn captureEnd(self: *Timing) void {
-        _ = c_clock.clock_gettime(CLOCK_MONOTONIC, &self.real_end);
-        _ = c_clock.clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &self.cpu_end);
+    fn stop(self: *Timing) void {
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, @ptrCast(&self.real_end));
+        _ = c.clock_gettime(c.CLOCK_PROCESS_CPUTIME_ID, @ptrCast(&self.cpu_end));
     }
 
     fn print(self: *const Timing) void {
-        const real: u64 = @intCast(timespecDiff(self.real_end, self.real_start));
-        const cpu: u64 = @intCast(timespecDiff(self.cpu_end, self.cpu_start));
-        const pct = if (real > 0) @as(f64, @floatFromInt(cpu)) / @as(f64, @floatFromInt(real)) * 100.0 else 0.0;
-        std.debug.print("real\t{d}.{d:03}s\ncpu\t{d}.{d:03}s\n%\t{d:.1}\n", .{
-            real / 1_000_000_000, (real % 1_000_000_000) / 1_000_000,
-            cpu / 1_000_000_000,  (cpu % 1_000_000_000) / 1_000_000,
-            pct,
-        });
+        const real_ns = timespecDiff(self.real_end, self.real_start);
+        const cpu_ns = timespecDiff(self.cpu_end, self.cpu_start);
+        const real_u: u64 = if (real_ns > 0) @intCast(real_ns) else 0;
+        const cpu_u: u64 = if (cpu_ns > 0) @intCast(cpu_ns) else 0;
+        const pct = if (real_u > 0)
+            @as(f64, @floatFromInt(cpu_u)) / @as(f64, @floatFromInt(real_u)) * 100.0
+        else
+            0.0;
+
+        std.debug.print(
+            "real\t{d}.{d:03}s\ncpu\t{d}.{d:03}s\nCPU\t{d:.1}%\n",
+            .{
+                real_u / 1_000_000_000,
+                (real_u % 1_000_000_000) / 1_000_000,
+                cpu_u / 1_000_000_000,
+                (cpu_u % 1_000_000_000) / 1_000_000,
+                pct,
+            },
+        );
     }
 };
-
-fn timespecDiff(a: Timespec, b: Timespec) i64 {
-    return @as(i64, a.tv_sec - b.tv_sec) * 1_000_000_000 + @as(i64, a.tv_nsec - b.tv_nsec);
-}
 
 const Task = struct {
     pathz: []u8,
@@ -162,6 +169,28 @@ const Task = struct {
     root_dev: c.dev_t,
     next: ?*Task = null,
     prev: ?*Task = null,
+};
+
+const TaskBatch = struct {
+    first: ?*Task = null,
+    last: ?*Task = null,
+    count: usize = 0,
+
+    fn append(self: *TaskBatch, task: *Task) void {
+        task.next = null;
+        task.prev = self.last;
+        if (self.last) |last| {
+            last.next = task;
+        } else {
+            self.first = task;
+        }
+        self.last = task;
+        self.count += 1;
+    }
+
+    fn reset(self: *TaskBatch) void {
+        self.* = .{};
+    }
 };
 
 const TaskQueue = struct {
@@ -173,45 +202,65 @@ const TaskQueue = struct {
     mu: Mutex = .init,
     cv: Condition = .init,
 
-    fn push(self: *TaskQueue, task: *Task) void {
-        task.next = null;
-        task.prev = null;
+    fn pushBatch(self: *TaskQueue, batch: *TaskBatch) bool {
+        if (batch.count == 0) return true;
+
         self.mu.lock(global_io) catch unreachable;
         defer self.mu.unlock(global_io);
-        task.prev = self.tail;
+
+        if (self.done) return false;
+
         if (self.tail) |tail| {
-            tail.next = task;
+            tail.next = batch.first;
+            batch.first.?.prev = tail;
         } else {
-            self.head = task;
+            self.head = batch.first;
         }
-        self.tail = task;
-        self.queued += 1;
-        self.pending_dirs += 1;
-        self.cv.signal(global_io);
+        self.tail = batch.last;
+        self.queued += batch.count;
+        self.pending_dirs += batch.count;
+
+        if (batch.count == 1) {
+            self.cv.signal(global_io);
+        } else {
+            self.cv.broadcast(global_io);
+        }
+        return true;
     }
 
     fn pop(self: *TaskQueue, mode: WalkMode) ?*Task {
         self.mu.lock(global_io) catch unreachable;
         defer self.mu.unlock(global_io);
+
         while (!self.done and self.head == null) {
             self.cv.wait(global_io, &self.mu) catch unreachable;
         }
-        if (self.done) return null;
-        if (self.head == null) return null;
 
-        var task: *Task = undefined;
-        switch (mode) {
-            .bfs => {
-                task = self.head.?;
-                self.head = task.next;
-                if (self.head) |head| head.prev = null else self.tail = null;
+        if (self.done or self.head == null) return null;
+
+        const task: *Task = switch (mode) {
+            .bfs => blk: {
+                const item = self.head.?;
+                self.head = item.next;
+                if (self.head) |head| {
+                    head.prev = null;
+                } else {
+                    self.tail = null;
+                }
+                break :blk item;
             },
-            .dfs => {
-                task = self.tail.?;
-                self.tail = task.prev;
-                if (self.tail) |tail| tail.next = null else self.head = null;
+            .dfs => blk: {
+                const item = self.tail.?;
+                self.tail = item.prev;
+                if (self.tail) |tail| {
+                    tail.next = null;
+                } else {
+                    self.head = null;
+                }
+                break :blk item;
             },
-        }
+        };
+
         task.next = null;
         task.prev = null;
         self.queued -= 1;
@@ -221,6 +270,7 @@ const TaskQueue = struct {
     fn taskDone(self: *TaskQueue) void {
         self.mu.lock(global_io) catch unreachable;
         defer self.mu.unlock(global_io);
+
         if (self.pending_dirs > 0) self.pending_dirs -= 1;
         if (self.pending_dirs == 0 and self.queued == 0) {
             self.done = true;
@@ -231,6 +281,7 @@ const TaskQueue = struct {
     fn finalizeIfIdle(self: *TaskQueue) void {
         self.mu.lock(global_io) catch unreachable;
         defer self.mu.unlock(global_io);
+
         if (self.pending_dirs == 0 and self.queued == 0) {
             self.done = true;
             self.cv.broadcast(global_io);
@@ -243,11 +294,56 @@ const TaskQueue = struct {
         self.done = true;
         self.cv.broadcast(global_io);
     }
+
+    fn drain(self: *TaskQueue, allocator: Allocator) void {
+        var current = self.head;
+        while (current) |task| {
+            const next = task.next;
+            allocator.free(task.pathz);
+            allocator.destroy(task);
+            current = next;
+        }
+        self.head = null;
+        self.tail = null;
+        self.queued = 0;
+        self.pending_dirs = 0;
+    }
 };
 
 const Output = struct {
     mu: Mutex = .init,
-    use_lock: bool = false,
+    failed: AtomicBool = AtomicBool.init(false),
+
+    fn write(self: *Output, bytes: []const u8) bool {
+        if (bytes.len == 0) return true;
+        if (self.failed.load(.acquire)) return false;
+
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
+
+        if (self.failed.load(.monotonic)) return false;
+        const written = c.fwrite(bytes.ptr, 1, bytes.len, c.stdout);
+        if (written != bytes.len) {
+            self.failed.store(true, .release);
+            return false;
+        }
+        return true;
+    }
+
+    fn reportErrno(self: *Output, progname: []const u8, operation: []const u8, path: []const u8, err_no: c_int) void {
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
+
+        const message_ptr = c.strerror(err_no);
+        const message = if (message_ptr == null) "unknown error" else std.mem.span(message_ptr);
+        std.debug.print("{s}: {s} '{s}': {s}\n", .{ progname, operation, path, message });
+    }
+
+    fn reportMessage(self: *Output, progname: []const u8, message: []const u8) void {
+        self.mu.lock(global_io) catch unreachable;
+        defer self.mu.unlock(global_io);
+        std.debug.print("{s}: {s}\n", .{ progname, message });
+    }
 };
 
 const Stats = struct {
@@ -258,70 +354,386 @@ const Stats = struct {
     matched: AtomicU64 = AtomicU64.init(0),
     errors: AtomicU64 = AtomicU64.init(0),
     dirs_enqueued: AtomicU64 = AtomicU64.init(0),
+    bytes_emitted: AtomicU64 = AtomicU64.init(0),
 };
 
 const WorkerCtx = struct {
     allocator: Allocator,
     opt: *const Options,
     queue: *TaskQueue,
-    out: *Output,
+    output: *Output,
     stats: *Stats,
     progname: []const u8,
+    now: Timespec,
+    fatal: *AtomicBool,
 };
 
-const VERSION = "1.0.0";
+const WorkerLocal = struct {
+    path_buf: std.ArrayList(u8) = .empty,
+    out_buf: std.ArrayList(u8) = .empty,
+    task_batch: TaskBatch = .{},
 
-fn usage(progname: []const u8) void {
-    std.debug.print(
-        "usage: {s} [path ...] [options]\n\n" ++
-            "raid: low-level rigorous recursive file traversal utility\n\n" ++
-            "options:\n" ++
-            "  -name PAT             basename glob filter\n" ++
-            "  -path PAT             full-path glob filter\n" ++
-            "  -exclude PAT          exclude basenames from matching\n" ++
-            "  -exclude-path PAT     exclude full paths from matching\n" ++
-            "  -prune PAT            prune basenames from descent\n" ++
-            "  -prune-path PAT       prune full paths from descent\n" ++
-            "  -ext EXT              match file extension (dot optional)\n" ++
-            "  -contains TEXT        match paths containing literal text\n" ++
-            "  -type C               file type: f d l b c p s\n" ++
-            "  -uid N                exact uid filter\n" ++
-            "  -gid N                exact gid filter\n" ++
-            "  -inode N              exact inode filter\n" ++
-            "  -perm MODE            exact octal permission match\n" ++
-            "  -newer PATH           only match files newer than PATH\n" ++
-            "  -mindepth N           minimum depth to match\n" ++
-            "  -maxdepth N           maximum depth to descend or match\n" ++
-            "  -xdev                 do not cross filesystem boundaries\n" ++
-            "  -one-file-system      alias for -xdev\n" ++
-            "  -skip-vfs             prune /proc /sys /dev /run when traversing /\n" ++
-            "  -H, --hidden          include hidden files\n" ++
-            "  -walk bfs|dfs         traversal queue mode\n" ++
-            "  -storage auto|hdd|ssd|raid\n" ++
-            "                         tune default workers and walk order\n" ++
-            "  -j N                  worker threads (default: storage-tuned)\n" ++
-            "  -0, -print0           NUL-delimited output\n" ++
-            "  -noprint              do not emit matches\n" ++
-            "  -limit N              stop after N matches\n" ++
-            "  -q, -quiet            suppress traversal errors\n" ++
-            "  -stats                print counters to stderr\n" ++
-            "  -time                 print timing info\n" ++
-            "  -h, --help            show this help\n" ++
-            "  -V, --version         show version\n",
-        .{progname},
-    );
+    fn init(self: *WorkerLocal, allocator: Allocator) !void {
+        try self.path_buf.ensureTotalCapacity(allocator, 4096);
+        try self.out_buf.ensureTotalCapacity(allocator, OUTPUT_FLUSH_THRESHOLD);
+    }
+
+    fn deinit(self: *WorkerLocal, allocator: Allocator) void {
+        self.path_buf.deinit(allocator);
+        self.out_buf.deinit(allocator);
+    }
+};
+
+fn errnoLocation() *c_int {
+    return c.__errno_location();
 }
 
-fn parseInt(comptime T: type, s: []const u8) !T {
-    return std.fmt.parseInt(T, s, 10);
+fn currentErrno() c_int {
+    return errnoLocation().*;
 }
 
-fn parseMode(s: []const u8) !c.mode_t {
-    return @as(c.mode_t, @intCast(try std.fmt.parseInt(u32, s, 8)));
+fn onSignal(sig: c_int) callconv(.c) void {
+    _ = sig;
+    signal_seen = 1;
 }
 
-fn baseName(path: []const u8) []const u8 {
-    return std.fs.path.basename(path);
+const SignalHandler = *const fn (c_int) callconv(.c) void;
+extern "c" fn signal(sig: c_int, handler: SignalHandler) SignalHandler;
+
+fn installSignalHandlers() void {
+    _ = signal(c.SIGINT, &onSignal);
+    _ = signal(c.SIGTERM, &onSignal);
+}
+
+fn interrupted() bool {
+    return signal_seen != 0;
+}
+
+fn timespecDiff(a: Timespec, b: Timespec) i64 {
+    return (a.tv_sec - b.tv_sec) * 1_000_000_000 + (a.tv_nsec - b.tv_nsec);
+}
+
+fn pathSlice(pathz: []u8) []const u8 {
+    return pathz[0 .. pathz.len - 1];
+}
+
+fn dupeZ(allocator: Allocator, input: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, input.len + 1);
+    std.mem.copyForwards(u8, out[0..input.len], input);
+    out[input.len] = 0;
+    return out;
+}
+
+fn normalizeRoot(path: []const u8) []const u8 {
+    if (path.len == 0) return ".";
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') end -= 1;
+    return path[0..end];
+}
+
+fn buildChildPath(local: *WorkerLocal, allocator: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
+    const needs_slash = dir.len > 0 and dir[dir.len - 1] != '/';
+    const total = dir.len + @as(usize, if (needs_slash) 1 else 0) + name.len;
+    try local.path_buf.ensureTotalCapacity(allocator, total + 1);
+    local.path_buf.items.len = total + 1;
+
+    var offset: usize = 0;
+    std.mem.copyForwards(u8, local.path_buf.items[offset .. offset + dir.len], dir);
+    offset += dir.len;
+    if (needs_slash) {
+        local.path_buf.items[offset] = '/';
+        offset += 1;
+    }
+    std.mem.copyForwards(u8, local.path_buf.items[offset .. offset + name.len], name);
+    local.path_buf.items[total] = 0;
+    return local.path_buf.items[0..total];
+}
+
+fn visiblePath(opt: *const Options, path: []const u8) []const u8 {
+    if (!opt.strip_dot_slash) return path;
+    var out = path;
+    while (std.mem.startsWith(u8, out, "./") and out.len > 2) out = out[2..];
+    return out;
+}
+
+fn hasUpperAscii(text: []const u8) bool {
+    for (text) |ch| {
+        if (ch >= 'A' and ch <= 'Z') return true;
+    }
+    return false;
+}
+
+fn matchingIsInsensitive(opt: *const Options) bool {
+    return switch (opt.case_mode) {
+        .sensitive => false,
+        .insensitive => true,
+        .smart => if (opt.pattern) |pattern| !hasUpperAscii(pattern) else true,
+    };
+}
+
+fn foldAscii(ch: u8) u8 {
+    return if (ch >= 'A' and ch <= 'Z') ch + ('a' - 'A') else ch;
+}
+
+fn charsEqual(a: u8, b: u8, insensitive: bool) bool {
+    return if (insensitive) foldAscii(a) == foldAscii(b) else a == b;
+}
+
+fn containsText(haystack: []const u8, needle: []const u8, insensitive: bool) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len and charsEqual(haystack[i + j], needle[j], insensitive)) : (j += 1) {}
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+const ClassResult = struct {
+    matched: bool,
+    next_index: usize,
+    valid: bool,
+};
+
+fn matchClass(pattern: []const u8, start: usize, ch: u8, insensitive: bool) ClassResult {
+    var i = start + 1;
+    if (i >= pattern.len) return .{ .matched = false, .next_index = start + 1, .valid = false };
+
+    var negate = false;
+    if (pattern[i] == '!' or pattern[i] == '^') {
+        negate = true;
+        i += 1;
+    }
+
+    var any = false;
+    var first = true;
+    while (i < pattern.len) {
+        if (pattern[i] == ']' and !first) {
+            return .{ .matched = if (negate) !any else any, .next_index = i + 1, .valid = true };
+        }
+        first = false;
+
+        var lo = pattern[i];
+        if (lo == '\\' and i + 1 < pattern.len) {
+            i += 1;
+            lo = pattern[i];
+        }
+
+        if (i + 2 < pattern.len and pattern[i + 1] == '-' and pattern[i + 2] != ']') {
+            var hi = pattern[i + 2];
+            if (insensitive) {
+                lo = foldAscii(lo);
+                hi = foldAscii(hi);
+            }
+            const value = if (insensitive) foldAscii(ch) else ch;
+            if (value >= lo and value <= hi) any = true;
+            i += 3;
+        } else {
+            if (charsEqual(lo, ch, insensitive)) any = true;
+            i += 1;
+        }
+    }
+
+    return .{ .matched = false, .next_index = start + 1, .valid = false };
+}
+
+fn tokenMatches(pattern: []const u8, index: usize, ch: u8, insensitive: bool) struct { ok: bool, next: usize } {
+    if (index >= pattern.len) return .{ .ok = false, .next = index };
+    const token = pattern[index];
+    if (token == '?') return .{ .ok = true, .next = index + 1 };
+    if (token == '[') {
+        const class = matchClass(pattern, index, ch, insensitive);
+        if (class.valid) return .{ .ok = class.matched, .next = class.next_index };
+    }
+    if (token == '\\' and index + 1 < pattern.len) {
+        return .{ .ok = charsEqual(pattern[index + 1], ch, insensitive), .next = index + 2 };
+    }
+    return .{ .ok = charsEqual(token, ch, insensitive), .next = index + 1 };
+}
+
+fn globMatches(pattern: []const u8, text: []const u8, insensitive: bool) bool {
+    var pi: usize = 0;
+    var ti: usize = 0;
+    var star_pattern: ?usize = null;
+    var star_text: usize = 0;
+
+    while (ti < text.len) {
+        if (pi < pattern.len and pattern[pi] == '*') {
+            while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+            star_pattern = pi;
+            star_text = ti;
+            if (pi == pattern.len) return true;
+            continue;
+        }
+
+        const token = tokenMatches(pattern, pi, text[ti], insensitive);
+        if (token.ok) {
+            pi = token.next;
+            ti += 1;
+            continue;
+        }
+
+        if (star_pattern) |resume| {
+            star_text += 1;
+            if (star_text > text.len) return false;
+            ti = star_text;
+            pi = resume;
+            continue;
+        }
+        return false;
+    }
+
+    while (pi < pattern.len and pattern[pi] == '*') pi += 1;
+    return pi == pattern.len;
+}
+
+fn anyGlobMatches(patterns: []const []const u8, basename: []const u8, path: []const u8, insensitive: bool) bool {
+    for (patterns) |pattern| {
+        if (globMatches(pattern, basename, insensitive) or globMatches(pattern, path, insensitive)) return true;
+    }
+    return false;
+}
+
+fn extensionMatches(opt: *const Options, basename: []const u8, insensitive: bool) bool {
+    if (opt.extensions.len == 0) return true;
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= basename.len) return false;
+    const actual = basename[dot + 1 ..];
+
+    for (opt.extensions) |raw_ext| {
+        const ext = if (raw_ext.len > 0 and raw_ext[0] == '.') raw_ext[1..] else raw_ext;
+        if (ext.len != actual.len) continue;
+        var i: usize = 0;
+        while (i < ext.len and charsEqual(ext[i], actual[i], insensitive)) : (i += 1) {}
+        if (i == ext.len) return true;
+    }
+    return false;
+}
+
+fn patternMatches(opt: *const Options, basename: []const u8, path: []const u8) bool {
+    const pattern = opt.pattern orelse return true;
+    const target = if (opt.full_path) path else basename;
+    const insensitive = matchingIsInsensitive(opt);
+    return if (opt.glob)
+        globMatches(pattern, target, insensitive)
+    else
+        containsText(target, pattern, insensitive);
+}
+
+fn typeBit(type_char: u8) u16 {
+    return switch (type_char) {
+        'f' => 1 << 0,
+        'd' => 1 << 1,
+        'l' => 1 << 2,
+        'b' => 1 << 3,
+        'c' => 1 << 4,
+        'p' => 1 << 5,
+        's' => 1 << 6,
+        else => 1 << 7,
+    };
+}
+
+fn typeCharFromMode(mode: c.mode_t) u8 {
+    if ((mode & c.S_IFMT) == c.S_IFREG) return 'f';
+    if ((mode & c.S_IFMT) == c.S_IFDIR) return 'd';
+    if ((mode & c.S_IFMT) == c.S_IFLNK) return 'l';
+    if ((mode & c.S_IFMT) == c.S_IFBLK) return 'b';
+    if ((mode & c.S_IFMT) == c.S_IFCHR) return 'c';
+    if ((mode & c.S_IFMT) == c.S_IFIFO) return 'p';
+    if ((mode & c.S_IFMT) == c.S_IFSOCK) return 's';
+    return '?';
+}
+
+fn typeCharFromDirent(dtype: u8) u8 {
+    return switch (dtype) {
+        c.DT_REG => 'f',
+        c.DT_DIR => 'd',
+        c.DT_LNK => 'l',
+        c.DT_BLK => 'b',
+        c.DT_CHR => 'c',
+        c.DT_FIFO => 'p',
+        c.DT_SOCK => 's',
+        else => '?',
+    };
+}
+
+fn noteType(stats: *Stats, type_char: u8) void {
+    switch (type_char) {
+        'f' => _ = stats.files_seen.fetchAdd(1, .monotonic),
+        'd' => _ = stats.dirs_seen.fetchAdd(1, .monotonic),
+        'l' => _ = stats.links_seen.fetchAdd(1, .monotonic),
+        else => _ = stats.others_seen.fetchAdd(1, .monotonic),
+    }
+}
+
+fn needsStat(opt: *const Options, type_char: u8) bool {
+    return type_char == '?' or
+        opt.uid_set or
+        opt.gid_set or
+        opt.inode_set or
+        opt.perm_set or
+        opt.size_min != null or
+        opt.size_max != null or
+        opt.newer_than != null or
+        opt.age_max_ns != null or
+        opt.age_min_ns != null or
+        opt.executable_only or
+        opt.empty_only or
+        opt.long or
+        opt.classify or
+        (opt.xdev and type_char == 'd');
+}
+
+fn timespecGreater(a: Timespec, b: Timespec) bool {
+    return a.tv_sec > b.tv_sec or (a.tv_sec == b.tv_sec and a.tv_nsec > b.tv_nsec);
+}
+
+fn metadataMatches(opt: *const Options, st: ?*const c.struct_stat, now: Timespec) bool {
+    const requires = opt.uid_set or opt.gid_set or opt.inode_set or opt.perm_set or
+        opt.size_min != null or opt.size_max != null or opt.newer_than != null or
+        opt.age_max_ns != null or opt.age_min_ns != null or opt.executable_only or
+        opt.empty_only;
+    if (!requires) return true;
+    if (st == null) return false;
+
+    const value = st.?;
+    if (opt.uid_set and value.st_uid != opt.uid) return false;
+    if (opt.gid_set and value.st_gid != opt.gid) return false;
+    if (opt.inode_set and value.st_ino != opt.inode) return false;
+    if (opt.perm_set and (value.st_mode & 0o7777) != opt.perm) return false;
+
+    const size: u64 = if (value.st_size > 0) @intCast(value.st_size) else 0;
+    if (opt.size_min) |minimum| if (size < minimum) return false;
+    if (opt.size_max) |maximum| if (size > maximum) return false;
+
+    const modified = Timespec{ .tv_sec = value.st_mtim.tv_sec, .tv_nsec = value.st_mtim.tv_nsec };
+    if (opt.newer_than) |reference| {
+        if (!timespecGreater(modified, reference)) return false;
+    }
+
+    const age_i = timespecDiff(now, modified);
+    const age: u64 = if (age_i > 0) @intCast(age_i) else 0;
+    if (opt.age_max_ns) |maximum_age| if (age > maximum_age) return false;
+    if (opt.age_min_ns) |minimum_age| if (age < minimum_age) return false;
+
+    if (opt.executable_only and (value.st_mode & 0o111) == 0) return false;
+    if (opt.empty_only and value.st_size != 0) return false;
+    return true;
+}
+
+fn entryMatches(opt: *const Options, basename: []const u8, path: []const u8, st: ?*const c.struct_stat, type_char: u8, depth: i32, now: Timespec) bool {
+    if (depth < opt.min_depth or depth > opt.max_depth) return false;
+    if (opt.type_mask != 0 and (opt.type_mask & typeBit(type_char)) == 0) return false;
+
+    const insensitive = matchingIsInsensitive(opt);
+    if (opt.excludes.len != 0 and anyGlobMatches(opt.excludes, basename, path, insensitive)) return false;
+    if (!extensionMatches(opt, basename, insensitive)) return false;
+    if (!patternMatches(opt, basename, path)) return false;
+    if (!metadataMatches(opt, st, now)) return false;
+    return true;
 }
 
 fn isVfsPath(path: []const u8) bool {
@@ -335,53 +747,17 @@ fn isVfsPath(path: []const u8) bool {
         std.mem.startsWith(u8, path, "/run/");
 }
 
-fn fileTypeCharFromMode(mode: c.mode_t) u8 {
-    if ((mode & c.S_IFMT) == c.S_IFREG) return 'f';
-    if ((mode & c.S_IFMT) == c.S_IFDIR) return 'd';
-    if ((mode & c.S_IFMT) == c.S_IFLNK) return 'l';
-    if ((mode & c.S_IFMT) == c.S_IFBLK) return 'b';
-    if ((mode & c.S_IFMT) == c.S_IFCHR) return 'c';
-    if ((mode & c.S_IFMT) == c.S_IFIFO) return 'p';
-    if ((mode & c.S_IFMT) == c.S_IFSOCK) return 's';
-    return '?';
+fn shouldPruneDirectory(opt: *const Options, basename: []const u8, path: []const u8) bool {
+    if (opt.skip_vfs and isVfsPath(path)) return true;
+    const insensitive = matchingIsInsensitive(opt);
+    if (opt.excludes.len != 0 and anyGlobMatches(opt.excludes, basename, path, insensitive)) return true;
+    if (opt.prunes.len == 0) return false;
+    return anyGlobMatches(opt.prunes, basename, path, insensitive);
 }
 
-fn direntTypeChar(dtype: u8) u8 {
-    return switch (dtype) {
-        c.DT_REG => 'f',
-        c.DT_DIR => 'd',
-        c.DT_LNK => 'l',
-        c.DT_BLK => 'b',
-        c.DT_CHR => 'c',
-        c.DT_FIFO => 'p',
-        c.DT_SOCK => 's',
-        else => '?',
-    };
-}
-
-fn noteType(stats: *Stats, t: u8) void {
-    switch (t) {
-        'f' => _ = stats.files_seen.fetchAdd(1, .monotonic),
-        'd' => _ = stats.dirs_seen.fetchAdd(1, .monotonic),
-        'l' => _ = stats.links_seen.fetchAdd(1, .monotonic),
-        else => _ = stats.others_seen.fetchAdd(1, .monotonic),
-    }
-}
-
-fn reportError(ctx: *const WorkerCtx, path: []const u8) void { // bullshit ass function
-    _ = ctx.stats.errors.fetchAdd(1, .monotonic);
-    if (!ctx.opt.quiet_errors) {
-        std.debug.print("{s}: {s}: error\n", .{ ctx.progname, path });
-    }
-}
-
-fn noteMatch(stats: *Stats) void {
-    _ = stats.matched.fetchAdd(1, .monotonic);
-}
-
-fn recordMatch(ctx: *WorkerCtx) bool {
+fn reserveMatch(ctx: *WorkerCtx) bool {
     if (ctx.opt.limit == 0) {
-        if (ctx.opt.stats) noteMatch(ctx.stats);
+        if (ctx.opt.stats) _ = ctx.stats.matched.fetchAdd(1, .monotonic);
         return true;
     }
 
@@ -391,608 +767,996 @@ fn recordMatch(ctx: *WorkerCtx) bool {
     return true;
 }
 
-fn recordRootMatch(opt: *const Options, queue: *TaskQueue, stats: *Stats) bool {
-    if (opt.limit == 0) {
-        if (opt.stats) noteMatch(stats);
-        return true;
-    }
-
-    const old = stats.matched.fetchAdd(1, .monotonic);
-    if (old >= opt.limit) return false;
-    if (old + 1 >= opt.limit) queue.abort();
-    return true;
+fn colorFor(type_char: u8, st: ?*const c.struct_stat) []const u8 {
+    if (type_char == 'd') return "\x1b[1;34m";
+    if (type_char == 'l') return "\x1b[1;36m";
+    if (type_char == 'p') return "\x1b[33m";
+    if (type_char == 's') return "\x1b[1;35m";
+    if (type_char == 'b' or type_char == 'c') return "\x1b[1;33m";
+    if (type_char == 'f' and st != null and (st.?.st_mode & 0o111) != 0) return "\x1b[1;32m";
+    return "";
 }
 
-fn limitReached(opt: *const Options, stats: *Stats) bool {
-    return opt.limit != 0 and stats.matched.load(.monotonic) >= opt.limit;
+fn classifySuffix(type_char: u8, st: ?*const c.struct_stat) []const u8 {
+    return switch (type_char) {
+        'd' => "/",
+        'l' => "@",
+        'p' => "|",
+        's' => "=",
+        'f' => if (st != null and (st.?.st_mode & 0o111) != 0) "*" else "",
+        else => "",
+    };
 }
 
-fn outputPath(out: *Output, opt: *const Options, path: []const u8) void {
-    if (out.use_lock) out.mu.lock(global_io) catch unreachable;
-    defer if (out.use_lock) out.mu.unlock(global_io);
-    _ = c.fwrite(path.ptr, 1, path.len, c.stdout);
-    _ = c.fputc(if (opt.print0) 0 else '\n', c.stdout);
-}
-
-fn timespecGt(a: Timespec, b: Timespec) bool {
-    if (a.tv_sec > b.tv_sec) return true;
-    if (a.tv_sec < b.tv_sec) return false;
-    return a.tv_nsec > b.tv_nsec;
-}
-
-fn filtersRequireStat(opt: *const Options) bool {
-    return opt.uid_set or opt.gid_set or opt.inode_set or opt.perm_set or opt.newer_set;
-}
-
-fn baseNameZ(pathz: []u8) [*:0]const u8 {
-    const p = pathSlice(pathz);
-    const b = baseName(p);
-    const off = p.len - b.len;
-    return @ptrCast(pathz.ptr + off);
-}
-
-fn fnmatchOk(patz: ?[]const u8, zstr: [*:0]const u8) bool {
-    if (patz == null) return true;
-    const pptr: [*:0]const u8 = @ptrCast(patz.?.ptr);
-    return c.fnmatch(pptr, zstr, 0) == 0;
-}
-
-fn extMatches(base: []const u8, ext: []const u8) bool {
-    const needle = if (ext.len > 0 and ext[0] == '.') ext[1..] else ext;
-    if (needle.len == 0) return false;
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return false;
-    if (dot == 0 or dot + 1 >= base.len) return false;
-    return std.mem.eql(u8, base[dot + 1 ..], needle);
-}
-
-fn matchesFiltersZ(opt: *const Options, pathz: []u8, st: ?*const c.struct_stat, type_char: u8, depth: i32) bool {
-    if (depth < opt.mindepth or depth > opt.maxdepth) return false;
-
-    if (opt.type_filter != 0 and type_char != opt.type_filter) return false;
-
-    const path_ptr: [*:0]const u8 = @ptrCast(pathz.ptr);
-    const base_ptr = baseNameZ(pathz);
-
-    if (opt.exclude_pat != null and fnmatchOk(opt.exclude_pat, base_ptr)) return false;
-    if (opt.exclude_path_pat != null and fnmatchOk(opt.exclude_path_pat, path_ptr)) return false;
-
-    if (opt.name_pat != null and !fnmatchOk(opt.name_pat, base_ptr)) return false;
-    if (opt.path_pat != null and !fnmatchOk(opt.path_pat, path_ptr)) return false;
-    if (opt.ext_pat) |ext| {
-        if (!extMatches(baseName(pathSlice(pathz)), ext)) return false;
-    }
-    if (opt.contains_pat) |needle| {
-        if (std.mem.indexOf(u8, pathSlice(pathz), needle) == null) return false;
-    }
-
-    if (opt.uid_set or opt.gid_set or opt.inode_set or opt.perm_set or opt.newer_set) {
-        if (st == null) return false;
-        const s = st.?;
-        if (opt.uid_set and s.st_uid != opt.uid) return false;
-        if (opt.gid_set and s.st_gid != opt.gid) return false;
-        if (opt.inode_set and s.st_ino != opt.inode) return false;
-        if (opt.perm_set and ((s.st_mode & 0o7777) != opt.perm)) return false;
-        if (opt.newer_set) {
-            const st_mtim = Timespec{ .tv_sec = s.st_mtim.tv_sec, .tv_nsec = s.st_mtim.tv_nsec };
-            if (!timespecGt(st_mtim, opt.newer)) return false;
-        }
-    }
-
-    return true;
-}
-
-fn shouldPruneZ(opt: *const Options, pathz: []u8) bool {
-    const path = pathSlice(pathz);
-    if (opt.skip_vfs and isVfsPath(path)) return true;
-    const path_ptr: [*:0]const u8 = @ptrCast(pathz.ptr);
-    const base_ptr = baseNameZ(pathz);
-    if (opt.prune_pat != null and fnmatchOk(opt.prune_pat, base_ptr)) return true;
-    if (opt.prune_path_pat != null and fnmatchOk(opt.prune_path_pat, path_ptr)) return true;
-    return false;
-}
-
-fn dupeZ(allocator: Allocator, s: []const u8) ![]u8 {
-    var out = try allocator.alloc(u8, s.len + 1);
-    std.mem.copyForwards(u8, out[0..s.len], s);
-    out[s.len] = 0;
+fn modeString(mode: c.mode_t, type_char: u8) [10]u8 {
+    var out: [10]u8 = .{ '-', '-', '-', '-', '-', '-', '-', '-', '-', '-' };
+    out[0] = switch (type_char) {
+        'd' => 'd',
+        'l' => 'l',
+        'b' => 'b',
+        'c' => 'c',
+        'p' => 'p',
+        's' => 's',
+        else => '-',
+    };
+    const bits = [_]c.mode_t{ 0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001 };
+    const chars = "rwxrwxrwx";
+    for (bits, 0..) |bit, i| if ((mode & bit) != 0) out[i + 1] = chars[i];
     return out;
 }
 
-fn joinPathZ(allocator: Allocator, dir: []const u8, name: [*]const u8, name_len: usize) ![]u8 {
-    const need_slash = dir.len > 0 and dir[dir.len - 1] != '/';
-    const total = dir.len + @as(usize, if (need_slash) 1 else 0) + name_len;
-    var out = try allocator.alloc(u8, total + 1);
-    var off: usize = 0;
-    std.mem.copyForwards(u8, out[off .. off + dir.len], dir);
-    off += dir.len;
-    if (need_slash) {
-        out[off] = '/';
-        off += 1;
+fn humanSizeText(buffer: *[48]u8, size: u64) ![]const u8 {
+    const units = [_][]const u8{ "B", "K", "M", "G", "T", "P" };
+    var value = @as(f64, @floatFromInt(size));
+    var unit: usize = 0;
+    while (value >= 1024.0 and unit + 1 < units.len) {
+        value /= 1024.0;
+        unit += 1;
     }
-    std.mem.copyForwards(u8, out[off .. off + name_len], name[0..name_len]);
-    out[total] = 0;
-    return out;
+
+    return if (unit == 0)
+        std.fmt.bufPrint(buffer, "{d}{s}", .{ size, units[unit] })
+    else
+        std.fmt.bufPrint(buffer, "{d:.1}{s}", .{ value, units[unit] });
 }
 
-fn pathSlice(pathz: []u8) []const u8 {
-    return pathz[0 .. pathz.len - 1];
+fn timestampText(buffer: *[32]u8, seconds: i64) []const u8 {
+    var timestamp: c.time_t = @intCast(seconds);
+    var tm_value: c.struct_tm = undefined;
+    if (c.localtime_r(&timestamp, &tm_value) == null) return "0000-00-00 00:00";
+    const length = c.strftime(buffer, buffer.len, "%Y-%m-%d %H:%M", &tm_value);
+    if (length == 0) return "0000-00-00 00:00";
+    return buffer[0..length];
 }
 
-fn needStatForEntry(opt: *const Options, type_char: u8) bool {
-    if (type_char == '?') return true;
-    if (filtersRequireStat(opt)) return true;
-    if (opt.xdev and type_char == 'd') return true;
-    return false;
+fn flushOutput(ctx: *WorkerCtx, local: *WorkerLocal) bool {
+    if (local.out_buf.items.len == 0) return true;
+    const bytes = local.out_buf.items;
+    const ok = ctx.output.write(bytes);
+    if (ok) _ = ctx.stats.bytes_emitted.fetchAdd(bytes.len, .monotonic);
+    local.out_buf.clearRetainingCapacity();
+    if (!ok) ctx.queue.abort();
+    return ok;
 }
 
-fn openDirZ(zpath: [*:0]const u8) c_int {
+fn appendOutput(ctx: *WorkerCtx, local: *WorkerLocal, bytes: []const u8) !void {
+    try local.out_buf.appendSlice(ctx.allocator, bytes);
+}
+
+fn emitMatch(ctx: *WorkerCtx, local: *WorkerLocal, raw_path: []const u8, type_char: u8, st: ?*const c.struct_stat) !void {
+    if (ctx.opt.noprint) return;
+    if (local.out_buf.items.len >= OUTPUT_FLUSH_THRESHOLD and !flushOutput(ctx, local)) return error.OutputFailure;
+
+    const path = visiblePath(ctx.opt, raw_path);
+    if (ctx.opt.long) {
+        const value = st orelse return error.MissingStat;
+        const mode = modeString(value.st_mode, type_char);
+        try appendOutput(ctx, local, &mode);
+        try appendOutput(ctx, local, "  ");
+
+        var size_buffer: [48]u8 = undefined;
+        const size: u64 = if (value.st_size > 0) @intCast(value.st_size) else 0;
+        const size_text = if (ctx.opt.human_readable)
+            try humanSizeText(&size_buffer, size)
+        else
+            try std.fmt.bufPrint(&size_buffer, "{d}", .{value.st_size});
+        try appendOutput(ctx, local, size_text);
+        try appendOutput(ctx, local, "  ");
+
+        var time_buffer: [32]u8 = undefined;
+        try appendOutput(ctx, local, timestampText(&time_buffer, value.st_mtim.tv_sec));
+        try appendOutput(ctx, local, "  ");
+    }
+
+    if (ctx.opt.use_color) {
+        const color = colorFor(type_char, st);
+        if (color.len != 0) try appendOutput(ctx, local, color);
+        try appendOutput(ctx, local, path);
+        if (ctx.opt.classify) try appendOutput(ctx, local, classifySuffix(type_char, st));
+        if (color.len != 0) try appendOutput(ctx, local, "\x1b[0m");
+    } else {
+        try appendOutput(ctx, local, path);
+        if (ctx.opt.classify) try appendOutput(ctx, local, classifySuffix(type_char, st));
+    }
+
+    try appendOutput(ctx, local, if (ctx.opt.print0) "\x00" else "\n");
+    if (local.out_buf.items.len >= OUTPUT_FLUSH_THRESHOLD and !flushOutput(ctx, local)) return error.OutputFailure;
+}
+
+fn noteError(ctx: *WorkerCtx, operation: []const u8, path: []const u8, err_no: c_int) void {
+    _ = ctx.stats.errors.fetchAdd(1, .monotonic);
+    if (!ctx.opt.quiet_errors) ctx.output.reportErrno(ctx.progname, operation, path, err_no);
+}
+
+fn markFatal(ctx: *WorkerCtx, message: []const u8) void {
+    if (!ctx.fatal.swap(true, .acq_rel)) ctx.output.reportMessage(ctx.progname, message);
+    ctx.queue.abort();
+}
+
+fn openDirectory(pathz: [*:0]const u8) c_int {
     const flags = c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC;
     if (comptime @hasDecl(c, "O_NOATIME")) {
-        const fd = c.open(zpath, flags | c.O_NOATIME);
+        const fd = c.open(pathz, flags | c.O_NOATIME);
         if (fd >= 0) return fd;
+        if (currentErrno() != c.EPERM) return fd;
     }
-    return c.open(zpath, flags);
+    return c.open(pathz, flags);
 }
 
-fn processDirectory(ctx: *WorkerCtx, task: *Task) void {
-    const pathz = task.pathz;
-    const path = pathSlice(pathz);
-    const zpath: [*:0]const u8 = @ptrCast(pathz.ptr);
-    const fd = openDirZ(zpath);
+extern "c" fn syscall(number: c_long, ...) c_long;
+
+fn getdents64(fd: c_int, buffer: []u8) c_long {
+    return syscall(
+        @as(c_long, @intCast(c.SYS_getdents64)),
+        @as(c_int, fd),
+        @as(*anyopaque, @ptrCast(buffer.ptr)),
+        @as(usize, buffer.len),
+    );
+}
+
+fn freeTaskBatch(allocator: Allocator, batch: *TaskBatch) void {
+    var current = batch.first;
+    while (current) |task| {
+        const next = task.next;
+        allocator.free(task.pathz);
+        allocator.destroy(task);
+        current = next;
+    }
+    batch.reset();
+}
+
+fn flushTaskBatch(ctx: *WorkerCtx, local: *WorkerLocal) bool {
+    if (local.task_batch.count == 0) return true;
+    if (!ctx.queue.pushBatch(&local.task_batch)) {
+        freeTaskBatch(ctx.allocator, &local.task_batch);
+        return false;
+    }
+    if (ctx.opt.stats) _ = ctx.stats.dirs_enqueued.fetchAdd(local.task_batch.count, .monotonic);
+    local.task_batch.reset();
+    return true;
+}
+
+fn queueDirectory(ctx: *WorkerCtx, local: *WorkerLocal, path: []const u8, depth: i32, root_dev: c.dev_t) !bool {
+    const task = try ctx.allocator.create(Task);
+    errdefer ctx.allocator.destroy(task);
+    const pathz = try dupeZ(ctx.allocator, path);
+    errdefer ctx.allocator.free(pathz);
+
+    task.* = .{
+        .pathz = pathz,
+        .depth = depth,
+        .root_dev = root_dev,
+    };
+    local.task_batch.append(task);
+    if (local.task_batch.count >= TASK_BATCH_SIZE) return flushTaskBatch(ctx, local);
+    return true;
+}
+
+fn processDirectory(ctx: *WorkerCtx, local: *WorkerLocal, task: *Task) !void {
+    const dir_path = pathSlice(task.pathz);
+    const dir_z: [*:0]const u8 = @ptrCast(task.pathz.ptr);
+    const fd = openDirectory(dir_z);
     if (fd < 0) {
-        reportError(ctx, path);
+        noteError(ctx, "cannot open directory", dir_path, currentErrno());
         return;
     }
-    _ = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    defer _ = c.close(fd);
 
-    const hidden = ctx.opt.hidden;
-    const skip_vfs = ctx.opt.skip_vfs;
-    const prune_pat = ctx.opt.prune_pat;
-    const prune_path_pat = ctx.opt.prune_path_pat;
-    const need_stat = filtersRequireStat(ctx.opt) or ctx.opt.xdev;
+    var read_buffer: [READ_BUFFER_SIZE]u8 align(@alignOf(LinuxDirent64)) = undefined;
 
-    const dirp = fdopendir(fd);
-    if (dirp == null) {
-        _ = c.close(fd);
-        return;
-    }
-    defer _ = closedir(dirp);
-
-    while (true) {
-        const de_raw = readdir(dirp);
-        if (de_raw == null) break;
-
-        const de = @as(*const DIRENT, @ptrCast(@alignCast(de_raw.?)));
-        const name_ptr: [*]const u8 = @ptrCast(&de.d_name);
-        var name_len: usize = 0;
-        while (name_ptr[name_len] != 0) name_len += 1;
-
-        if (name_len == 1 and name_ptr[0] == '.') continue;
-        if (name_len == 2 and name_ptr[0] == '.' and name_ptr[1] == '.') continue;
-        if (!hidden and name_len > 0 and name_ptr[0] == '.') continue;
-
-        const child_pathz = joinPathZ(ctx.allocator, path, name_ptr, name_len) catch continue;
-        const child_path = pathSlice(child_pathz);
-        const child_depth = task.depth + 1;
-
-        if ((skip_vfs and isVfsPath(child_path)) or
-            (prune_pat != null and fnmatchOk(prune_pat, baseNameZ(child_pathz))) or
-            (prune_path_pat != null and fnmatchOk(prune_path_pat, @ptrCast(child_pathz.ptr))))
-        {
-            ctx.allocator.free(child_pathz);
-            continue;
+    read_loop: while (true) {
+        if (interrupted()) {
+            ctx.queue.abort();
+            break;
         }
 
-        var type_char: u8 = switch (de.d_type) {
-            DT_DIR => 'd',
-            DT_REG => 'f',
-            DT_LNK => 'l',
-            DT_BLK => 'b',
-            DT_CHR => 'c',
-            DT_FIFO => 'p',
-            DT_SOCK => 's',
-            else => '?',
-        };
+        const count_raw = getdents64(fd, &read_buffer);
+        if (count_raw == 0) break;
+        if (count_raw < 0) {
+            const err_no = currentErrno();
+            if (err_no == c.EINTR and !interrupted()) continue;
+            noteError(ctx, "cannot read directory", dir_path, err_no);
+            break;
+        }
 
-        var st: c.struct_stat = undefined;
-        var have_stat = false;
-
-        if (type_char == '?' or need_stat) {
-            if (c.fstatat(fd, @as([*:0]const u8, @ptrFromInt(@intFromPtr(name_ptr))), &st, c.AT_SYMLINK_NOFOLLOW) != 0) {
-                reportError(ctx, child_path);
-                ctx.allocator.free(child_pathz);
-                continue;
+        const count: usize = @intCast(count_raw);
+        var offset: usize = 0;
+        while (offset < count) {
+            if (interrupted()) {
+                ctx.queue.abort();
+                break :read_loop;
             }
-            have_stat = true;
-            if (type_char == '?') type_char = fileTypeCharFromMode(st.st_mode);
-        }
 
-        if (ctx.opt.stats) noteType(ctx.stats, type_char);
-
-        if (matchesFiltersZ(ctx.opt, child_pathz, if (have_stat) &st else null, type_char, child_depth)) {
-            if (recordMatch(ctx) and !ctx.opt.noprint) outputPath(ctx.out, ctx.opt, child_path);
-            if (limitReached(ctx.opt, ctx.stats)) {
-                ctx.allocator.free(child_pathz);
-                break;
+            if (count - offset < @offsetOf(LinuxDirent64, "d_name")) {
+                noteError(ctx, "malformed directory data for", dir_path, c.EIO);
+                break :read_loop;
             }
-        }
 
-        if (type_char == 'd' and child_depth < ctx.opt.maxdepth) {
-            var same_fs_ok = true;
+            const entry: *const LinuxDirent64 = @ptrCast(@alignCast(read_buffer.ptr + offset));
+            const record_len: usize = entry.d_reclen;
+            const name_offset = @offsetOf(LinuxDirent64, "d_name");
+            if (record_len <= name_offset or offset + record_len > count) {
+                noteError(ctx, "malformed directory data for", dir_path, c.EIO);
+                break :read_loop;
+            }
+
+            const name_storage = read_buffer[offset + name_offset .. offset + record_len];
+            const nul = std.mem.indexOfScalar(u8, name_storage, 0) orelse {
+                noteError(ctx, "malformed directory name in", dir_path, c.EIO);
+                break :read_loop;
+            };
+            const name = name_storage[0..nul];
+            offset += record_len;
+
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (!ctx.opt.hidden and name[0] == '.') continue;
+
+            var type_char = typeCharFromDirent(entry.d_type);
+            var st: c.struct_stat = undefined;
+            var have_stat = false;
+
+            if (needsStat(ctx.opt, type_char)) {
+                const name_z: [*:0]const u8 = @ptrCast(name.ptr);
+                if (c.fstatat(fd, name_z, &st, c.AT_SYMLINK_NOFOLLOW) != 0) {
+                    const error_path = buildChildPath(local, ctx.allocator, dir_path, name) catch name;
+                    noteError(ctx, "cannot stat", error_path, currentErrno());
+                    continue;
+                }
+                have_stat = true;
+                if (type_char == '?') type_char = typeCharFromMode(st.st_mode);
+            }
+
+            if (ctx.opt.stats) noteType(ctx.stats, type_char);
+
+            const early_nonmatch = !ctx.opt.full_path and ctx.opt.pattern != null and !patternMatches(ctx.opt, name, name);
+            const ext_nonmatch = !extensionMatches(ctx.opt, name, matchingIsInsensitive(ctx.opt));
+            const is_dir = type_char == 'd';
+            const must_build_path = is_dir or ctx.opt.full_path or ctx.opt.excludes.len != 0 or
+                ctx.opt.prunes.len != 0 or (!early_nonmatch and !ext_nonmatch);
+
+            var child_path: []const u8 = "";
+            if (must_build_path) child_path = try buildChildPath(local, ctx.allocator, dir_path, name);
+
+            const child_depth = task.depth + 1;
+            if (!early_nonmatch and !ext_nonmatch and
+                entryMatches(ctx.opt, name, child_path, if (have_stat) &st else null, type_char, child_depth, ctx.now))
+            {
+                if (reserveMatch(ctx)) try emitMatch(ctx, local, child_path, type_char, if (have_stat) &st else null);
+                if (ctx.opt.limit != 0 and ctx.stats.matched.load(.monotonic) >= ctx.opt.limit) break :read_loop;
+            }
+
+            if (!is_dir or child_depth >= ctx.opt.max_depth) continue;
+            if (shouldPruneDirectory(ctx.opt, name, child_path)) continue;
+
             if (ctx.opt.xdev) {
                 if (!have_stat) {
-                    if (c.fstatat(fd, @as([*:0]const u8, @ptrFromInt(@intFromPtr(name_ptr))), &st, c.AT_SYMLINK_NOFOLLOW) != 0) {
-                        reportError(ctx, child_path);
-                        ctx.allocator.free(child_pathz);
+                    const name_z: [*:0]const u8 = @ptrCast(name.ptr);
+                    if (c.fstatat(fd, name_z, &st, c.AT_SYMLINK_NOFOLLOW) != 0) {
+                        noteError(ctx, "cannot stat directory", child_path, currentErrno());
                         continue;
                     }
+                    have_stat = true;
                 }
-                same_fs_ok = st.st_dev == task.root_dev;
+                if (st.st_dev != task.root_dev) continue;
             }
-            if (same_fs_ok) {
-                const next = ctx.allocator.create(Task) catch {
-                    reportError(ctx, child_path);
-                    ctx.allocator.free(child_pathz);
-                    continue;
-                };
-                next.* = .{
-                    .pathz = child_pathz,
-                    .depth = child_depth,
-                    .root_dev = task.root_dev,
-                    .next = null,
-                    .prev = null,
-                };
-                ctx.queue.push(next);
-                if (ctx.opt.stats) _ = ctx.stats.dirs_enqueued.fetchAdd(1, .monotonic);
-                continue;
-            }
-        }
 
-        ctx.allocator.free(child_pathz);
+            if (!try queueDirectory(ctx, local, child_path, child_depth, task.root_dev)) break :read_loop;
+        }
     }
+
+    _ = flushTaskBatch(ctx, local);
 }
 
 fn workerMain(ctx: *WorkerCtx) void {
+    var local = WorkerLocal{};
+    local.init(ctx.allocator) catch {
+        markFatal(ctx, "out of memory while initializing worker");
+        return;
+    };
+    defer {
+        if (local.task_batch.count != 0) freeTaskBatch(ctx.allocator, &local.task_batch);
+        _ = flushOutput(ctx, &local);
+        local.deinit(ctx.allocator);
+    }
+
     while (true) {
         const task = ctx.queue.pop(ctx.opt.walk_mode) orelse break;
-        processDirectory(ctx, task);
+
+        if (interrupted() or ctx.fatal.load(.acquire)) {
+            ctx.queue.abort();
+        } else {
+            processDirectory(ctx, &local, task) catch |err| switch (err) {
+                error.OutputFailure => ctx.queue.abort(),
+                error.OutOfMemory => markFatal(ctx, "out of memory during traversal"),
+                else => markFatal(ctx, "unexpected traversal failure"),
+            };
+        }
+
         ctx.allocator.free(task.pathz);
         ctx.allocator.destroy(task);
         ctx.queue.taskDone();
+
     }
 }
 
 fn autodetectThreads() i32 {
-    const n = c.sysconf(c._SC_NPROCESSORS_ONLN);
-    if (n < 1) return 1;
-    if (n > 64) return 64;
-    return @as(i32, @intCast(n));
-}
-
-fn storageName(mode: StorageMode) []const u8 {
-    return switch (mode) {
-        .auto => "auto",
-        .hdd => "hdd",
-        .ssd => "ssd",
-        .raid => "raid",
-    };
-}
-
-fn parseStorageMode(s: []const u8) ?StorageMode {
-    if (std.ascii.eqlIgnoreCase(s, "auto")) return .auto;
-    if (std.ascii.eqlIgnoreCase(s, "hdd")) return .hdd;
-    if (std.ascii.eqlIgnoreCase(s, "ssd")) return .ssd;
-    if (std.ascii.eqlIgnoreCase(s, "raid")) return .raid;
-    return null;
-}
-
-fn storageDefaultThreads(mode: StorageMode) i32 {
-    const cores = autodetectThreads();
-    return switch (mode) {
-        .hdd => if (cores > 2) 2 else cores,
-        .auto, .ssd, .raid => cores,
-    };
+    const count = c.sysconf(c._SC_NPROCESSORS_ONLN);
+    if (count < 1) return 1;
+    if (count > 64) return 64;
+    return @intCast(count);
 }
 
 fn applyStorageDefaults(opt: *Options) void {
-    if (opt.storage_mode == .hdd and !opt.walk_set) opt.walk_mode = .dfs;
-    if (opt.threads == 0) opt.threads = storageDefaultThreads(opt.storage_mode);
+    const cores = autodetectThreads();
+    if (opt.threads == 0) {
+        opt.threads = switch (opt.storage_mode) {
+            .hdd => @min(cores, 2),
+            .auto => @min(cores, 16),
+            .ssd => @min(cores, 32),
+        };
+    }
+    if (!opt.walk_set) {
+        opt.walk_mode = switch (opt.storage_mode) {
+            .hdd => .dfs,
+            .auto, .ssd => .bfs,
+        };
+    }
+}
+
+fn parseInt(comptime T: type, value: []const u8, option: []const u8, progname: []const u8) T {
+    return std.fmt.parseInt(T, value, 10) catch {
+        std.debug.print("{s}: invalid value for {s}: {s}\n", .{ progname, option, value });
+        std.process.exit(2);
+    };
+}
+
+fn parseOctal(value: []const u8, option: []const u8, progname: []const u8) c.mode_t {
+    const parsed = std.fmt.parseInt(u32, value, 8) catch {
+        std.debug.print("{s}: invalid octal value for {s}: {s}\n", .{ progname, option, value });
+        std.process.exit(2);
+    };
+    if (parsed > 0o7777) {
+        std.debug.print("{s}: permission mode exceeds 07777: {s}\n", .{ progname, value });
+        std.process.exit(2);
+    }
+    return @intCast(parsed);
+}
+
+fn checkedMul(value: u64, multiplier: u64, progname: []const u8, option: []const u8, original: []const u8) u64 {
+    const result = @mulWithOverflow(value, multiplier);
+    if (result[1] != 0) {
+        std.debug.print("{s}: value too large for {s}: {s}\n", .{ progname, option, original });
+        std.process.exit(2);
+    }
+    return result[0];
+}
+
+fn parseScaledU64(value: []const u8, progname: []const u8, option: []const u8) u64 {
+    if (value.len == 0) {
+        std.debug.print("{s}: missing numeric value for {s}\n", .{ progname, option });
+        std.process.exit(2);
+    }
+
+    var split = value.len;
+    while (split > 0 and ((value[split - 1] >= 'A' and value[split - 1] <= 'Z') or (value[split - 1] >= 'a' and value[split - 1] <= 'z'))) split -= 1;
+    const number_text = value[0..split];
+    const suffix = value[split..];
+    const number = std.fmt.parseInt(u64, number_text, 10) catch {
+        std.debug.print("{s}: invalid numeric value for {s}: {s}\n", .{ progname, option, value });
+        std.process.exit(2);
+    };
+
+    const multiplier: u64 = if (suffix.len == 0 or std.ascii.eqlIgnoreCase(suffix, "b"))
+        1
+    else if (std.ascii.eqlIgnoreCase(suffix, "k") or std.ascii.eqlIgnoreCase(suffix, "kb"))
+        1024
+    else if (std.ascii.eqlIgnoreCase(suffix, "m") or std.ascii.eqlIgnoreCase(suffix, "mb"))
+        1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(suffix, "g") or std.ascii.eqlIgnoreCase(suffix, "gb"))
+        1024 * 1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(suffix, "t") or std.ascii.eqlIgnoreCase(suffix, "tb"))
+        1024 * 1024 * 1024 * 1024
+    else {
+        std.debug.print("{s}: invalid size suffix for {s}: {s}\n", .{ progname, option, suffix });
+        std.process.exit(2);
+    };
+
+    return checkedMul(number, multiplier, progname, option, value);
+}
+
+fn parseSizeSpec(opt: *Options, value: []const u8, progname: []const u8) void {
+    if (value.len == 0) {
+        std.debug.print("{s}: empty --size value\n", .{progname});
+        std.process.exit(2);
+    }
+
+    const prefix = value[0];
+    const body = if (prefix == '+' or prefix == '-') value[1..] else value;
+    const size = parseScaledU64(body, progname, "--size");
+    if (prefix == '+') {
+        opt.size_min = if (size == std.math.maxInt(u64)) size else size + 1;
+    } else if (prefix == '-') {
+        opt.size_max = if (size == 0) 0 else size - 1;
+    } else {
+        opt.size_min = size;
+        opt.size_max = size;
+    }
+}
+
+fn parseDurationNs(value: []const u8, progname: []const u8, option: []const u8) u64 {
+    if (value.len < 2) {
+        std.debug.print("{s}: duration requires a suffix for {s}: {s}\n", .{ progname, option, value });
+        std.process.exit(2);
+    }
+
+    var split = value.len;
+    while (split > 0 and ((value[split - 1] >= 'A' and value[split - 1] <= 'Z') or (value[split - 1] >= 'a' and value[split - 1] <= 'z'))) split -= 1;
+    const number = std.fmt.parseInt(u64, value[0..split], 10) catch {
+        std.debug.print("{s}: invalid duration for {s}: {s}\n", .{ progname, option, value });
+        std.process.exit(2);
+    };
+    const suffix = value[split..];
+    const seconds: u64 = if (std.ascii.eqlIgnoreCase(suffix, "s"))
+        1
+    else if (std.ascii.eqlIgnoreCase(suffix, "m"))
+        60
+    else if (std.ascii.eqlIgnoreCase(suffix, "h"))
+        60 * 60
+    else if (std.ascii.eqlIgnoreCase(suffix, "d"))
+        24 * 60 * 60
+    else if (std.ascii.eqlIgnoreCase(suffix, "w"))
+        7 * 24 * 60 * 60
+    else {
+        std.debug.print("{s}: invalid duration suffix for {s}: {s}\n", .{ progname, option, suffix });
+        std.process.exit(2);
+    };
+
+    const total_seconds = checkedMul(number, seconds, progname, option, value);
+    return checkedMul(total_seconds, 1_000_000_000, progname, option, value);
+}
+
+fn parseType(opt: *Options, value: []const u8, progname: []const u8) void {
+    if (value.len != 1) {
+        std.debug.print("{s}: --type expects one of f,d,l,b,c,p,s,x,e\n", .{progname});
+        std.process.exit(2);
+    }
+    switch (value[0]) {
+        'f', 'd', 'l', 'b', 'c', 'p', 's' => opt.type_mask |= typeBit(value[0]),
+        'x' => opt.executable_only = true,
+        'e' => opt.empty_only = true,
+        else => {
+            std.debug.print("{s}: invalid file type: {s}\n", .{ progname, value });
+            std.process.exit(2);
+        },
+    }
+}
+
+fn requireValue(args: []const []const u8, index: *usize, option: []const u8, progname: []const u8) []const u8 {
+    index.* += 1;
+    if (index.* >= args.len) {
+        std.debug.print("{s}: missing value for {s}\n", .{ progname, option });
+        std.process.exit(2);
+    }
+    return args[index.*];
+}
+
+fn parseWalk(value: []const u8, progname: []const u8) WalkMode {
+    if (std.ascii.eqlIgnoreCase(value, "bfs")) return .bfs;
+    if (std.ascii.eqlIgnoreCase(value, "dfs")) return .dfs;
+    std.debug.print("{s}: invalid walk mode '{s}' (use bfs or dfs)\n", .{ progname, value });
+    std.process.exit(2);
+}
+
+fn parseStorage(value: []const u8, progname: []const u8) StorageMode {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "hdd")) return .hdd;
+    if (std.ascii.eqlIgnoreCase(value, "ssd")) return .ssd;
+    std.debug.print("{s}: invalid storage mode '{s}' (use auto, hdd, or ssd)\n", .{ progname, value });
+    std.process.exit(2);
+}
+
+fn parseColor(value: []const u8, progname: []const u8) ColorMode {
+    if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(value, "always")) return .always;
+    if (std.ascii.eqlIgnoreCase(value, "never")) return .never;
+    std.debug.print("{s}: invalid color mode '{s}' (use auto, always, or never)\n", .{ progname, value });
+    std.process.exit(2);
+}
+
+fn stdoutIsTty() bool {
+    return c.isatty(c.fileno(c.stdout)) == 1;
+}
+
+fn noColorEnvironment() bool {
+    return c.getenv("NO_COLOR") != null;
+}
+
+fn usage(progname: []const u8, color: bool) void {
+    const bold = if (color) "\x1b[1m" else "";
+    const cyan = if (color) "\x1b[1;36m" else "";
+    const yellow = if (color) "\x1b[1;33m" else "";
+    const reset = if (color) "\x1b[0m" else "";
+
+    std.debug.print(
+        "{s}raid{s} {s}— extremely fast parallel file search for Linux{s}\n\n" ++
+            "{s}USAGE{s}\n" ++
+            "  {s} [OPTIONS] [PATTERN] [PATH ...]\n" ++
+            "  {s} [OPTIONS] --path PATH [--path PATH ...] [PATTERN]\n\n" ++
+            "{s}MATCHING{s}\n" ++
+            "  -g, --glob                 Treat PATTERN as a glob instead of a substring\n" ++
+            "  -p, --full-path            Match PATTERN against the full path\n" ++
+            "  -i, --ignore-case          Case-insensitive matching\n" ++
+            "  -s, --case-sensitive       Case-sensitive matching\n" ++
+            "  -e, --extension EXT        Match an extension; repeatable\n" ++
+            "  -E, --exclude GLOB         Exclude matching names or paths; repeatable\n" ++
+            "      --prune GLOB           Do not descend into matching directories\n" ++
+            "  -t, --type TYPE            f,d,l,b,c,p,s,x(executable),e(empty)\n\n" ++
+            "{s}FILTERS{s}\n" ++
+            "      --size SIZE            Exact, +minimum, or -maximum; suffix K/M/G/T\n" ++
+            "      --changed-within DUR    Modified within 10s, 5m, 2h, 3d, or 1w\n" ++
+            "      --changed-before DUR    Modified more than DUR ago\n" ++
+            "      --newer FILE            Modified more recently than FILE\n" ++
+            "      --uid N --gid N         Exact owner filters\n" ++
+            "      --inode N               Exact inode filter\n" ++
+            "      --perm MODE             Exact octal permission bits\n" ++
+            "      --min-depth N           Minimum result depth\n" ++
+            "  -d, --max-depth N           Maximum traversal depth\n\n" ++
+            "{s}TRAVERSAL{s}\n" ++
+            "  -H, --hidden                Include hidden entries\n" ++
+            "      --one-file-system       Do not cross filesystem boundaries\n" ++
+            "      --skip-vfs              Skip /proc, /sys, /dev, and /run\n" ++
+            "  -j, --threads N             Worker count; 0 selects a tuned default\n" ++
+            "      --storage MODE          auto, hdd, or ssd\n" ++
+            "      --walk MODE             bfs or dfs\n" ++
+            "      --path PATH             Add an explicit search root; repeatable\n" ++
+            "  -a, --absolute              Canonicalize roots to absolute paths\n\n" ++
+            "{s}OUTPUT{s}\n" ++
+            "  -l, --long                  Permissions, size, timestamp, and path\n" ++
+            "  -h, --human-readable        Human-readable sizes with --long\n" ++
+            "      --classify              Append /, @, *, |, or = indicators\n" ++
+            "      --color WHEN            auto, always, or never\n" ++
+            "  -0, --print0                NUL-delimit results\n" ++
+            "      --no-strip-prefix       Keep a leading ./ in output\n" ++
+            "      --max-results N         Stop after N matches\n" ++
+            "      --no-print              Traverse without printing matches\n" ++
+            "  -q, --quiet                 Suppress traversal errors\n" ++
+            "      --stats                 Print counters\n" ++
+            "      --time                  Print wall and CPU time\n\n" ++
+            "{s}GENERAL{s}\n" ++
+            "      --help                  Show this help\n" ++
+            "  -V, --version               Show version\n\n" ++
+            "{s}Examples{s}\n" ++
+            "  {s} config src\n" ++
+            "  {s} -e zig -t f .\n" ++
+            "  {s} -g '*.png' ~/Pictures --color always\n" ++
+            "  {s} --size +100M --type f /mnt/storage\n",
+        .{
+            cyan,
+            reset,
+            yellow,
+            reset,
+            bold,
+            reset,
+            progname,
+            progname,
+            bold,
+            reset,
+            bold,
+            reset,
+            bold,
+            reset,
+            bold,
+            reset,
+            bold,
+            reset,
+            bold,
+            reset,
+            bold,
+            reset,
+            progname,
+            progname,
+            progname,
+            progname,
+        },
+    );
+}
+
+fn canonicalizeRoot(allocator: Allocator, root: []const u8, progname: []const u8) []const u8 {
+    const rootz = dupeZ(allocator, root) catch {
+        std.debug.print("{s}: out of memory\n", .{progname});
+        std.process.exit(2);
+    };
+    defer allocator.free(rootz);
+
+    const resolved_ptr = c.realpath(@ptrCast(rootz.ptr), null);
+    if (resolved_ptr == null) {
+        const err_no = currentErrno();
+        const message_ptr = c.strerror(err_no);
+        const message = if (message_ptr == null) "unknown error" else std.mem.span(message_ptr);
+        std.debug.print("{s}: cannot resolve '{s}': {s}\n", .{ progname, root, message });
+        std.process.exit(2);
+    }
+    defer c.free(resolved_ptr);
+
+    const resolved = std.mem.span(resolved_ptr);
+    return allocator.dupe(u8, resolved) catch {
+        std.debug.print("{s}: out of memory\n", .{progname});
+        std.process.exit(2);
+    };
+}
+
+fn looksLikeDirectory(path: []const u8, allocator: Allocator) bool {
+    const pathz = dupeZ(allocator, path) catch return false;
+    defer allocator.free(pathz);
+    var st: c.struct_stat = undefined;
+    if (c.stat(@ptrCast(pathz.ptr), &st) != 0) return false;
+    return (st.st_mode & c.S_IFMT) == c.S_IFDIR;
 }
 
 pub fn main(init: std.process.Init) !void {
-    setSignalHandler();
-    const allocator = init.arena.allocator();
     global_io = init.io;
-    const args = try init.minimal.args.toSlice(allocator);
+    installSignalHandlers();
 
+    const parse_allocator = init.arena.allocator();
+    const work_allocator = std.heap.smp_allocator;
+    const args = try init.minimal.args.toSlice(parse_allocator);
     if (args.len == 0) return;
     const progname = args[0];
 
     var opt = Options{};
-    var roots: std.ArrayList([]const u8) = .empty;
-    defer roots.deinit(allocator);
+    var extensions: std.ArrayList([]const u8) = .empty;
+    var excludes: std.ArrayList([]const u8) = .empty;
+    var prunes: std.ArrayList([]const u8) = .empty;
+    var explicit_roots: std.ArrayList([]const u8) = .empty;
+    var positionals: std.ArrayList([]const u8) = .empty;
 
+    var pattern_was_explicit = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--")) {
             i += 1;
-            while (i < args.len) : (i += 1) try roots.append(allocator, args[i]);
+            while (i < args.len) : (i += 1) try positionals.append(parse_allocator, args[i]);
             break;
-        } else if (std.mem.eql(u8, arg, "-name")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -name\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.name_pat = try dupeZ(allocator, args[i]);
-        } else if (std.mem.eql(u8, arg, "-path")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -path\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.path_pat = try dupeZ(allocator, args[i]);
-        } else if (std.mem.eql(u8, arg, "-exclude")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -exclude\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.exclude_pat = try dupeZ(allocator, args[i]);
-        } else if (std.mem.eql(u8, arg, "-exclude-path")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -exclude-path\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.exclude_path_pat = try dupeZ(allocator, args[i]);
-        } else if (std.mem.eql(u8, arg, "-prune")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -prune\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.prune_pat = try dupeZ(allocator, args[i]);
-        } else if (std.mem.eql(u8, arg, "-prune-path")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -prune-path\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.prune_path_pat = try dupeZ(allocator, args[i]);
-        } else if (std.mem.eql(u8, arg, "-ext") or std.mem.eql(u8, arg, "-extension")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -ext\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.ext_pat = args[i];
-        } else if (std.mem.eql(u8, arg, "-contains")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("{s}: missing argument for -contains\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.contains_pat = args[i];
-        } else if (std.mem.eql(u8, arg, "-type")) {
-            i += 1;
-            if (i >= args.len or args[i].len != 1 or std.mem.indexOfScalar(u8, "fdlbcps", args[i][0]) == null) {
-                std.debug.print("{s}: invalid -type\n", .{progname});
-                std.process.exit(2);
-            }
-            opt.type_filter = args[i][0];
-        } else if (std.mem.eql(u8, arg, "-uid")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.uid = try parseInt(c.uid_t, args[i]);
-            opt.uid_set = true;
-        } else if (std.mem.eql(u8, arg, "-gid")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.gid = try parseInt(c.gid_t, args[i]);
-            opt.gid_set = true;
-        } else if (std.mem.eql(u8, arg, "-inode")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.inode = try parseInt(c.ino_t, args[i]);
-            opt.inode_set = true;
-        } else if (std.mem.eql(u8, arg, "-perm")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.perm = try parseMode(args[i]);
-            opt.perm_set = true;
-        } else if (std.mem.eql(u8, arg, "-newer")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            const refz = try dupeZ(allocator, args[i]);
-            defer allocator.free(refz);
-            var st: c.struct_stat = undefined;
-            const refptr: [*:0]const u8 = @ptrCast(refz.ptr);
-            if (c.stat(refptr, &st) != 0) {
-                std.debug.print("{s}: cannot stat reference path for -newer: {s}\n", .{ progname, args[i] });
-                std.process.exit(2);
-            }
-            opt.newer = Timespec{
-                .tv_sec = st.st_mtim.tv_sec,
-                .tv_nsec = st.st_mtim.tv_nsec,
-            };
-            opt.newer_set = true;
-        } else if (std.mem.eql(u8, arg, "-mindepth")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.mindepth = try parseInt(i32, args[i]);
-            if (opt.mindepth < 0) std.process.exit(2);
-        } else if (std.mem.eql(u8, arg, "-maxdepth")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.maxdepth = try parseInt(i32, args[i]);
-            if (opt.maxdepth < 0) std.process.exit(2);
-        } else if (std.mem.eql(u8, arg, "-j")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.threads = try parseInt(i32, args[i]);
-            if (opt.threads == 0) opt.threads = autodetectThreads();
-            if (opt.threads < 1) opt.threads = 1;
-        } else if (std.mem.eql(u8, arg, "-xdev") or std.mem.eql(u8, arg, "-one-file-system")) {
-            opt.xdev = true;
-        } else if (std.mem.eql(u8, arg, "-skip-vfs")) {
-            opt.skip_vfs = true;
-        } else if (std.mem.eql(u8, arg, "-H") or std.mem.eql(u8, arg, "--hidden")) {
-            opt.hidden = true;
-        } else if (std.mem.eql(u8, arg, "-0") or std.mem.eql(u8, arg, "-print0")) {
-            opt.print0 = true;
-        } else if (std.mem.eql(u8, arg, "-noprint")) {
-            opt.noprint = true;
-        } else if (std.mem.eql(u8, arg, "-limit")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.limit = try parseInt(u64, args[i]);
-        } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "-quiet")) {
-            opt.quiet_errors = true;
-        } else if (std.mem.eql(u8, arg, "-stats")) {
-            opt.stats = true;
-        } else if (std.mem.eql(u8, arg, "-time")) {
-            opt.timing = true;
-        } else if (std.mem.eql(u8, arg, "-walk")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            if (std.ascii.eqlIgnoreCase(args[i], "bfs")) opt.walk_mode = .bfs else if (std.ascii.eqlIgnoreCase(args[i], "dfs")) opt.walk_mode = .dfs else std.process.exit(2);
-            opt.walk_set = true;
-        } else if (std.mem.eql(u8, arg, "-storage") or std.mem.eql(u8, arg, "--storage")) {
-            i += 1;
-            if (i >= args.len) std.process.exit(2);
-            opt.storage_mode = parseStorageMode(args[i]) orelse {
-                std.debug.print("{s}: invalid -storage (use auto, hdd, ssd, or raid)\n", .{progname});
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            usage(progname);
+        } else if (std.mem.eql(u8, arg, "--help")) {
+            usage(progname, stdoutIsTty() and !noColorEnvironment());
             return;
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
-            std.debug.print("raid version {s}\n", .{VERSION});
+            std.debug.print("raid {s}\n", .{VERSION});
             return;
+        } else if (std.mem.eql(u8, arg, "-g") or std.mem.eql(u8, arg, "--glob")) {
+            opt.glob = true;
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--full-path")) {
+            opt.full_path = true;
+        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--ignore-case")) {
+            opt.case_mode = .insensitive;
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--case-sensitive")) {
+            opt.case_mode = .sensitive;
+        } else if (std.mem.eql(u8, arg, "--smart-case")) {
+            opt.case_mode = .smart;
+        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--extension")) {
+            try extensions.append(parse_allocator, requireValue(args, &i, arg, progname));
+        } else if (std.mem.eql(u8, arg, "-E") or std.mem.eql(u8, arg, "--exclude") or std.mem.eql(u8, arg, "-exclude")) {
+            try excludes.append(parse_allocator, requireValue(args, &i, arg, progname));
+        } else if (std.mem.eql(u8, arg, "--prune") or std.mem.eql(u8, arg, "-prune")) {
+            try prunes.append(parse_allocator, requireValue(args, &i, arg, progname));
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--type")) {
+            parseType(&opt, requireValue(args, &i, arg, progname), progname);
+        } else if (std.mem.eql(u8, arg, "-H") or std.mem.eql(u8, arg, "--hidden")) {
+            opt.hidden = true;
+        } else if (std.mem.eql(u8, arg, "--one-file-system") or std.mem.eql(u8, arg, "-xdev")) {
+            opt.xdev = true;
+        } else if (std.mem.eql(u8, arg, "--skip-vfs")) {
+            opt.skip_vfs = true;
+        } else if (std.mem.eql(u8, arg, "--min-depth") or std.mem.eql(u8, arg, "-mindepth")) {
+            opt.min_depth = parseInt(i32, requireValue(args, &i, arg, progname), arg, progname);
+            if (opt.min_depth < 0) std.process.exit(2);
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--max-depth") or std.mem.eql(u8, arg, "-maxdepth")) {
+            opt.max_depth = parseInt(i32, requireValue(args, &i, arg, progname), arg, progname);
+            if (opt.max_depth < 0) std.process.exit(2);
+        } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--threads")) {
+            opt.threads = parseInt(i32, requireValue(args, &i, arg, progname), arg, progname);
+            if (opt.threads < 0) std.process.exit(2);
+            if (opt.threads > 256) {
+                std.debug.print("{s}: refusing more than 256 worker threads\n", .{progname});
+                std.process.exit(2);
+            }
+        } else if (std.mem.eql(u8, arg, "--storage")) {
+            opt.storage_mode = parseStorage(requireValue(args, &i, arg, progname), progname);
+        } else if (std.mem.eql(u8, arg, "--walk")) {
+            opt.walk_mode = parseWalk(requireValue(args, &i, arg, progname), progname);
+            opt.walk_set = true;
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            parseSizeSpec(&opt, requireValue(args, &i, arg, progname), progname);
+        } else if (std.mem.eql(u8, arg, "--changed-within")) {
+            opt.age_max_ns = parseDurationNs(requireValue(args, &i, arg, progname), progname, arg);
+        } else if (std.mem.eql(u8, arg, "--changed-before")) {
+            opt.age_min_ns = parseDurationNs(requireValue(args, &i, arg, progname), progname, arg);
+        } else if (std.mem.eql(u8, arg, "--uid") or std.mem.eql(u8, arg, "-uid")) {
+            opt.uid = parseInt(c.uid_t, requireValue(args, &i, arg, progname), arg, progname);
+            opt.uid_set = true;
+        } else if (std.mem.eql(u8, arg, "--gid") or std.mem.eql(u8, arg, "-gid")) {
+            opt.gid = parseInt(c.gid_t, requireValue(args, &i, arg, progname), arg, progname);
+            opt.gid_set = true;
+        } else if (std.mem.eql(u8, arg, "--inode") or std.mem.eql(u8, arg, "-inode")) {
+            opt.inode = parseInt(c.ino_t, requireValue(args, &i, arg, progname), arg, progname);
+            opt.inode_set = true;
+        } else if (std.mem.eql(u8, arg, "--perm") or std.mem.eql(u8, arg, "-perm")) {
+            opt.perm = parseOctal(requireValue(args, &i, arg, progname), arg, progname);
+            opt.perm_set = true;
+        } else if (std.mem.eql(u8, arg, "--newer") or std.mem.eql(u8, arg, "-newer")) {
+            const reference = requireValue(args, &i, arg, progname);
+            const reference_z = try dupeZ(parse_allocator, reference);
+            var st: c.struct_stat = undefined;
+            if (c.stat(@ptrCast(reference_z.ptr), &st) != 0) {
+                const message_ptr = c.strerror(currentErrno());
+                const message = if (message_ptr == null) "unknown error" else std.mem.span(message_ptr);
+                std.debug.print("{s}: cannot stat reference '{s}': {s}\n", .{ progname, reference, message });
+                std.process.exit(2);
+            }
+            opt.newer_than = .{ .tv_sec = st.st_mtim.tv_sec, .tv_nsec = st.st_mtim.tv_nsec };
+        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--long")) {
+            opt.long = true;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--human-readable")) {
+            opt.human_readable = true;
+        } else if (std.mem.eql(u8, arg, "--classify")) {
+            opt.classify = true;
+        } else if (std.mem.eql(u8, arg, "--color")) {
+            opt.color_mode = parseColor(requireValue(args, &i, arg, progname), progname);
+        } else if (std.mem.startsWith(u8, arg, "--color=")) {
+            opt.color_mode = parseColor(arg[8..], progname);
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            opt.color_mode = .never;
+        } else if (std.mem.eql(u8, arg, "-0") or std.mem.eql(u8, arg, "--print0")) {
+            opt.print0 = true;
+        } else if (std.mem.eql(u8, arg, "--no-strip-prefix")) {
+            opt.strip_dot_slash = false;
+        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--absolute")) {
+            opt.absolute = true;
+        } else if (std.mem.eql(u8, arg, "--max-results") or std.mem.eql(u8, arg, "--limit") or std.mem.eql(u8, arg, "-limit")) {
+            opt.limit = parseInt(u64, requireValue(args, &i, arg, progname), arg, progname);
+        } else if (std.mem.eql(u8, arg, "--no-print") or std.mem.eql(u8, arg, "-noprint")) {
+            opt.noprint = true;
+        } else if (std.mem.eql(u8, arg, "-q") or std.mem.eql(u8, arg, "--quiet")) {
+            opt.quiet_errors = true;
+        } else if (std.mem.eql(u8, arg, "--stats")) {
+            opt.stats = true;
+        } else if (std.mem.eql(u8, arg, "--time")) {
+            opt.timing = true;
+        } else if (std.mem.eql(u8, arg, "--path")) {
+            try explicit_roots.append(parse_allocator, requireValue(args, &i, arg, progname));
+        } else if (std.mem.eql(u8, arg, "--pattern")) {
+            opt.pattern = requireValue(args, &i, arg, progname);
+            pattern_was_explicit = true;
+        } else if (std.mem.eql(u8, arg, "-name")) {
+            opt.pattern = requireValue(args, &i, arg, progname);
+            opt.glob = true;
+            pattern_was_explicit = true;
+        } else if (std.mem.eql(u8, arg, "-path")) {
+            opt.pattern = requireValue(args, &i, arg, progname);
+            opt.glob = true;
+            opt.full_path = true;
+            pattern_was_explicit = true;
         } else if (arg.len > 0 and arg[0] == '-') {
-            std.debug.print("{s}: unsupported option: {s}\n", .{ progname, arg });
-            usage(progname);
+            std.debug.print("{s}: unknown option: {s}\n", .{ progname, arg });
+            std.debug.print("Try '{s} --help'.\n", .{progname});
             std.process.exit(2);
         } else {
-            try roots.append(allocator, arg);
+            try positionals.append(parse_allocator, arg);
         }
     }
 
-    if (roots.items.len == 0) try roots.append(allocator, ".");
-    if (opt.mindepth > opt.maxdepth) std.process.exit(2);
+    opt.extensions = extensions.items;
+    opt.excludes = excludes.items;
+    opt.prunes = prunes.items;
+
+    var roots: std.ArrayList([]const u8) = .empty;
+    if (pattern_was_explicit) {
+        for (positionals.items) |root| try roots.append(parse_allocator, root);
+    } else if (explicit_roots.items.len != 0) {
+        if (positionals.items.len > 0) opt.pattern = positionals.items[0];
+        if (positionals.items.len > 1) {
+            std.debug.print("{s}: extra positional paths are not allowed with --path\n", .{progname});
+            std.process.exit(2);
+        }
+    } else if (positionals.items.len == 1 and looksLikeDirectory(positionals.items[0], parse_allocator)) {
+        try roots.append(parse_allocator, positionals.items[0]);
+    } else if (positionals.items.len > 0) {
+        opt.pattern = positionals.items[0];
+        for (positionals.items[1..]) |root| try roots.append(parse_allocator, root);
+    }
+
+    for (explicit_roots.items) |root| try roots.append(parse_allocator, root);
+    if (roots.items.len == 0) try roots.append(parse_allocator, ".");
+
+    if (opt.min_depth > opt.max_depth) {
+        std.debug.print("{s}: --min-depth exceeds --max-depth\n", .{progname});
+        std.process.exit(2);
+    }
+
+    if (opt.print0) opt.color_mode = .never;
+    opt.use_color = switch (opt.color_mode) {
+        .always => true,
+        .never => false,
+        .auto => stdoutIsTty() and !noColorEnvironment(),
+    };
     applyStorageDefaults(&opt);
 
     _ = c.setvbuf(c.stdout, null, c._IOFBF, 1024 * 1024);
 
+    var now_c: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_REALTIME, &now_c);
+    const now = Timespec{ .tv_sec = now_c.tv_sec, .tv_nsec = now_c.tv_nsec };
+
     var queue = TaskQueue{};
-    var out = Output{ .use_lock = opt.threads > 1 };
+    defer queue.drain(work_allocator);
+    var output = Output{};
     var stats = Stats{};
+    var fatal = AtomicBool.init(false);
     var timing: Timing = undefined;
-    if (opt.timing) timing = Timing.captureStart();
+    if (opt.timing) timing = Timing.start();
+
     var ctx = WorkerCtx{
-        .allocator = allocator,
+        .allocator = work_allocator,
         .opt = &opt,
         .queue = &queue,
-        .out = &out,
+        .output = &output,
         .stats = &stats,
         .progname = progname,
+        .now = now,
+        .fatal = &fatal,
     };
 
-    var exit_code: u8 = 0;
-
-    for (roots.items) |root| {
+    var initial_batch = TaskBatch{};
+    for (roots.items) |raw_root| {
+        const normalized = normalizeRoot(raw_root);
+        const root = if (opt.absolute) canonicalizeRoot(parse_allocator, normalized, progname) else normalized;
         if (opt.skip_vfs and isVfsPath(root)) continue;
 
-        const rootz = try dupeZ(allocator, root);
-        if (shouldPruneZ(&opt, rootz)) {
-            allocator.free(rootz);
-            continue;
-        }
-        const rootptr: [*:0]const u8 = @ptrCast(rootz.ptr);
+        const rootz = dupeZ(work_allocator, root) catch {
+            fatal.store(true, .release);
+            output.reportMessage(progname, "out of memory while preparing roots");
+            break;
+        };
+
         var st: c.struct_stat = undefined;
-        if (c.lstat(rootptr, &st) != 0) {
-            reportError(&ctx, root);
-            allocator.free(rootz);
-            exit_code = 1;
+        if (c.lstat(@ptrCast(rootz.ptr), &st) != 0) {
+            noteError(&ctx, "cannot stat", root, currentErrno());
+            work_allocator.free(rootz);
             continue;
         }
 
-        const type_char = fileTypeCharFromMode(st.st_mode);
+        const type_char = typeCharFromMode(st.st_mode);
         if (opt.stats) noteType(&stats, type_char);
-
-        if (matchesFiltersZ(&opt, rootz, &st, type_char, 0)) {
-            if (recordRootMatch(&opt, &queue, &stats) and !opt.noprint) outputPath(&out, &opt, root);
+        const basename = std.fs.path.basename(root);
+        if (entryMatches(&opt, basename, root, &st, type_char, 0, now)) {
+            if (reserveMatch(&ctx) and !opt.noprint) {
+                var local = WorkerLocal{};
+                local.init(work_allocator) catch {
+                    work_allocator.free(rootz);
+                    fatal.store(true, .release);
+                    output.reportMessage(progname, "out of memory while formatting root");
+                    break;
+                };
+                emitMatch(&ctx, &local, root, type_char, &st) catch {};
+                _ = flushOutput(&ctx, &local);
+                local.deinit(work_allocator);
+            }
         }
 
-        if (type_char == 'd' and opt.maxdepth > 0 and !limitReached(&opt, &stats)) {
-            const task = try allocator.create(Task);
-            task.* = .{
-                .pathz = rootz,
-                .depth = 0,
-                .root_dev = st.st_dev,
-                .next = null,
-                .prev = null,
+        if (type_char == 'd' and opt.max_depth > 0 and !queue.done and !shouldPruneDirectory(&opt, basename, root)) {
+            const task = work_allocator.create(Task) catch {
+                work_allocator.free(rootz);
+                fatal.store(true, .release);
+                output.reportMessage(progname, "out of memory while queuing root");
+                break;
             };
-            queue.push(task);
-            if (opt.stats) _ = stats.dirs_enqueued.fetchAdd(1, .monotonic);
+            task.* = .{ .pathz = rootz, .depth = 0, .root_dev = st.st_dev };
+            initial_batch.append(task);
         } else {
-            allocator.free(rootz);
+            work_allocator.free(rootz);
         }
     }
 
+    if (initial_batch.count != 0) {
+        if (queue.pushBatch(&initial_batch)) {
+            if (opt.stats) _ = stats.dirs_enqueued.fetchAdd(initial_batch.count, .monotonic);
+            initial_batch.reset();
+        } else {
+            freeTaskBatch(work_allocator, &initial_batch);
+        }
+    }
     queue.finalizeIfIdle();
 
-    if (opt.threads <= 1) {
-        workerMain(&ctx);
-    } else {
-        const tcount: usize = @intCast(opt.threads);
-        var threads = try allocator.alloc(std.Thread, tcount);
-        defer allocator.free(threads);
-        var created: usize = 0;
-        while (created < tcount) : (created += 1) {
-            threads[created] = std.Thread.spawn(.{}, workerMain, .{&ctx}) catch {
-                queue.abort();
-                var j: usize = 0;
-                while (j < created) : (j += 1) threads[j].join();
-                std.debug.print("{s}: failed to spawn thread\n", .{progname});
-                std.process.exit(2);
-            };
+    if (!fatal.load(.acquire) and !queue.done) {
+        if (opt.threads <= 1) {
+            workerMain(&ctx);
+        } else {
+            const thread_count: usize = @intCast(opt.threads);
+            const threads = try work_allocator.alloc(std.Thread, thread_count);
+            defer work_allocator.free(threads);
+
+            var created: usize = 0;
+            while (created < thread_count) : (created += 1) {
+                threads[created] = std.Thread.spawn(.{}, workerMain, .{&ctx}) catch {
+                    queue.abort();
+                    fatal.store(true, .release);
+                    output.reportMessage(progname, "failed to spawn worker thread");
+                    break;
+                };
+            }
+            for (threads[0..created]) |thread| thread.join();
         }
-        for (threads[0..created]) |th| th.join();
     }
 
-    if (opt.timing) timing.captureEnd();
-
+    if (opt.timing) timing.stop();
     _ = c.fflush(c.stdout);
 
-    if (stats.errors.load(.monotonic) != 0) exit_code = 1;
-
+    const matched_raw = stats.matched.load(.monotonic);
+    const matched = if (opt.limit != 0) @min(matched_raw, opt.limit) else matched_raw;
     if (opt.stats) {
         std.debug.print(
-            "matched={} files={} dirs={} links={} others={} queued_dirs={} errors={} threads={} walk={s} storage={s}\n",
+            "matched={} files={} dirs={} links={} others={} queued_dirs={} errors={} bytes={} threads={} walk={s} storage={s}\n",
             .{
-                stats.matched.load(.monotonic),
+                matched,
                 stats.files_seen.load(.monotonic),
                 stats.dirs_seen.load(.monotonic),
                 stats.links_seen.load(.monotonic),
                 stats.others_seen.load(.monotonic),
                 stats.dirs_enqueued.load(.monotonic),
                 stats.errors.load(.monotonic),
+                stats.bytes_emitted.load(.monotonic),
                 opt.threads,
                 if (opt.walk_mode == .bfs) "bfs" else "dfs",
-                storageName(opt.storage_mode),
+                switch (opt.storage_mode) {
+                    .auto => "auto",
+                    .hdd => "hdd",
+                    .ssd => "ssd",
+                },
             },
         );
     }
-
     if (opt.timing) timing.print();
 
-    if (interrupted) {
-        _ = c.fflush(c.stdout);
-        std.process.exit(130);
-    }
-    if (exit_code != 0) std.process.exit(exit_code);
+    if (interrupted()) std.process.exit(130);
+    if (fatal.load(.acquire)) std.process.exit(2);
+    if (stats.errors.load(.monotonic) != 0) std.process.exit(1);
+}
+
+test "substring matching supports smart ASCII case" {
+    try std.testing.expect(containsText("HelloWorld", "hello", true));
+    try std.testing.expect(!containsText("HelloWorld", "hello", false));
+}
+
+test "glob matching supports stars questions and classes" {
+    try std.testing.expect(globMatches("*.zig", "main.zig", false));
+    try std.testing.expect(globMatches("src/??in.[ch]", "src/main.c", false));
+    try std.testing.expect(!globMatches("*.zig", "main.c", false));
+}
+
+test "root normalization preserves slash" {
+    try std.testing.expectEqualStrings("/", normalizeRoot("////"));
+    try std.testing.expectEqualStrings("/tmp", normalizeRoot("/tmp///"));
+    try std.testing.expectEqualStrings(".", normalizeRoot(""));
 }
