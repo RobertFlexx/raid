@@ -1,0 +1,513 @@
+---
+title: raid benchmarks
+description: Full-system traversal benchmarks comparing raid and fd on Exherbo Linux.
+---
+
+export const StatCard = ({ label, value, children }) => (
+  <div
+    style={{
+      border: '1px solid var(--raid-border, #3a3a3a)',
+      borderRadius: '14px',
+      padding: '1rem 1.1rem',
+      background: 'var(--raid-card, rgba(127, 127, 127, 0.08))',
+      minWidth: 0,
+    }}
+  >
+    <div
+      style={{
+        fontSize: '0.78rem',
+        fontWeight: 700,
+        letterSpacing: '0.08em',
+        textTransform: 'uppercase',
+        opacity: 0.72,
+      }}
+    >
+      {label}
+    </div>
+    <div
+      style={{
+        fontSize: '1.8rem',
+        fontWeight: 800,
+        lineHeight: 1.15,
+        marginTop: '0.3rem',
+        fontVariantNumeric: 'tabular-nums',
+      }}
+    >
+      {value}
+    </div>
+    <div style={{ marginTop: '0.45rem', opacity: 0.8, fontSize: '0.92rem' }}>
+      {children}
+    </div>
+  </div>
+)
+
+export const StatGrid = ({ children }) => (
+  <div
+    style={{
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))',
+      gap: '0.9rem',
+      margin: '1.25rem 0 1.5rem',
+    }}
+  >
+    {children}
+  </div>
+)
+
+export const TimeBar = ({ name, value, max, note, winner = false }) => {
+  const width = `${Math.max(6, (value / max) * 100)}%`
+
+  return (
+    <div style={{ margin: '0.85rem 0' }}>
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          gap: '1rem',
+          marginBottom: '0.35rem',
+          fontVariantNumeric: 'tabular-nums',
+        }}
+      >
+        <strong>{name}</strong>
+        <span>
+          <strong>{value} ms</strong>
+          {note ? <span style={{ opacity: 0.65 }}> · {note}</span> : null}
+        </span>
+      </div>
+      <div
+        style={{
+          height: '12px',
+          overflow: 'hidden',
+          borderRadius: '999px',
+          background: 'var(--raid-track, rgba(127, 127, 127, 0.2))',
+        }}
+      >
+        <div
+          style={{
+            width,
+            height: '100%',
+            borderRadius: '999px',
+            background: winner
+              ? 'var(--raid-winner, #35c46a)'
+              : 'var(--raid-other, #8c8c8c)',
+          }}
+        />
+      </div>
+    </div>
+  )
+}
+
+export const Note = ({ title = 'note', children }) => (
+  <aside
+    style={{
+      borderLeft: '4px solid var(--raid-accent, #35c46a)',
+      borderRadius: '8px',
+      padding: '0.8rem 1rem',
+      margin: '1.2rem 0',
+      background: 'var(--raid-note, rgba(53, 196, 106, 0.09))',
+    }}
+  >
+    <strong>{title}</strong>
+    <div style={{ marginTop: '0.35rem' }}>{children}</div>
+  </aside>
+)
+
+# raid benchmarks
+
+raid is supposed to walk directory trees as fast and literally as possible. naturally, that means eventually putting it in a cage with `fd` and making both of them fight over `/`.
+
+These are real results from the Exherbo machine raid was developed on. They are not universal truths carved into a stone tablet. Filesystem type, cache state, mounts, permissions, hardware, kernel version, tool versions, and whether your computer is currently compiling Chromium for emotional damage can all change the result.
+
+Still, the result on this machine is not exactly subtle.
+
+<StatGrid>
+  <StatCard label="full traversal" value="1.78× faster">
+    raid averaged 194.0 ms while fd averaged 344.5 ms.
+  </StatCard>
+  <StatCard label="without virtual filesystems" value="1.98× faster">
+    raid averaged 172.7 ms while fd averaged 342.6 ms.
+  </StatCard>
+  <StatCard label="wall time saved" value="49.6%">
+    measured in the 20-run `/proc`, `/sys`, `/dev`, and `/run` excluded test.
+  </StatCard>
+  <StatCard label="user cpu saved" value="80.7%">
+    raid spent dramatically less time doing user-space work.
+  </StatCard>
+</StatGrid>
+
+> raid is not faster because it politely asks fewer directories for permission. it uses a smaller hot path, direct Linux directory reads, reused buffers, lazy metadata calls, and less user-space machinery.
+
+## Test setup
+
+raid was built with:
+
+```bash
+zig build-exe raid.zig -O ReleaseFast -lc -fstrip
+```
+
+The benchmark used Hyperfine with three warmup runs and either 10 or 20 measured runs.
+
+Output was redirected to `/dev/null`, which keeps terminal rendering from becoming the benchmark. Standard error was also redirected because a full `/` traversal can encounter permission failures, disappearing `/proc` entries, stale mounts, and other normal filesystem nonsense.
+
+`--ignore-failure` was required because raid returns exit code `1` when traversal completes but one or more entries produced an error. That behavior is intentional. raid does not quietly pretend unreadable paths never existed just to keep Hyperfine emotionally stable.
+
+<Note title="important">
+  These numbers measure warm full-tree traversal, matching, scheduling, formatting, and output into `/dev/null`. They do not measure cold-disk performance, interactive terminal rendering, ignore-file parsing, or regex-heavy workloads.
+</Note>
+
+## Benchmark one: literal full-system traversal
+
+Command:
+
+```bash
+hyperfine --ignore-failure --warmup 3 --runs 10 \
+  "raid --glob '*' -H / >/dev/null 2>/dev/null" \
+  "fd --hidden --no-ignore . / >/dev/null 2>/dev/null"
+```
+
+Results:
+
+| Tool | Mean | Standard deviation | Range | User CPU | System CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **raid** | **194.0 ms** | **3.3 ms** | **190.7–201.0 ms** | **338.8 ms** | 1095.2 ms |
+| fd | 344.5 ms | 12.2 ms | 331.6–374.1 ms | 1436.4 ms | **1088.5 ms** |
+
+<TimeBar name="raid" value={194.0} max={344.5} note="mean of 10 runs" winner />
+<TimeBar name="fd" value={344.5} max={344.5} note="mean of 10 runs" />
+
+Hyperfine summary:
+
+```text
+raid --glob '*' -H / >/dev/null 2>/dev/null ran
+  1.78 ± 0.07 times faster than fd --hidden --no-ignore . / >/dev/null 2>/dev/null
+```
+
+That means raid completed the traversal in about **43.7% less wall time**.
+
+The especially interesting part is the CPU split:
+
+| CPU category | raid | fd | Difference |
+| --- | ---: | ---: | ---: |
+| User CPU | 338.8 ms | 1436.4 ms | raid used **76.4% less** |
+| System CPU | 1095.2 ms | 1088.5 ms | almost identical |
+| Combined CPU | 1434.0 ms | 2524.9 ms | raid used **43.2% less** |
+
+Both tools spent almost the same amount of aggregate time inside the kernel. fd spent far more time in user space.
+
+That points at raid's intended advantages actually showing up in the benchmark:
+
+* direct `getdents64` directory reads
+* lazy `fstatat` calls
+* reusable worker buffers
+* batched directory queue operations
+* simpler glob and substring matching
+* no ignore-file parser
+* fewer temporary allocations
+* less formatting and framework overhead in the hot path
+
+In other words, the kernel charged both tools roughly the same admission fee. fd then bought fourteen dollars of popcorn.
+
+<details>
+  <summary><strong>raw Hyperfine output</strong></summary>
+
+```text
+Benchmark 1: raid --glob '*' -H / >/dev/null 2>/dev/null
+  Time (mean ± σ):     194.0 ms ±   3.3 ms    [User: 338.8 ms, System: 1095.2 ms]
+  Range (min … max):   190.7 ms … 201.0 ms    10 runs
+
+  Warning: Ignoring non-zero exit code.
+
+Benchmark 2: fd --hidden --no-ignore . / >/dev/null 2>/dev/null
+  Time (mean ± σ):     344.5 ms ±  12.2 ms    [User: 1436.4 ms, System: 1088.5 ms]
+  Range (min … max):   331.6 ms … 374.1 ms    10 runs
+
+Summary
+  raid --glob '*' -H / >/dev/null 2>/dev/null ran
+    1.78 ± 0.07 times faster than fd --hidden --no-ignore . / >/dev/null 2>/dev/null
+```
+
+</details>
+
+## Benchmark two: skip virtual filesystems
+
+The second benchmark avoids `/proc`, `/sys`, `/dev`, and `/run`.
+
+Those trees are noisy benchmark targets. Entries can appear or vanish while traversal is happening, and they contain kernel-backed objects that do not behave like ordinary disk files.
+
+Command:
+
+```bash
+hyperfine --ignore-failure --warmup 3 --runs 20 \
+  "raid --glob '*' -H --skip-vfs / >/dev/null 2>/dev/null" \
+  "fd --hidden --no-ignore \
+      --exclude proc --exclude sys --exclude dev --exclude run \
+      . / >/dev/null 2>/dev/null"
+```
+
+Results:
+
+| Tool | Mean | Standard deviation | Range | User CPU | System CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **raid** | **172.7 ms** | **12.7 ms** | **164.4–224.1 ms** | **291.2 ms** | 960.4 ms |
+| fd | 342.6 ms | 17.4 ms | 328.3–410.6 ms | 1505.7 ms | **957.2 ms** |
+
+<TimeBar name="raid" value={172.7} max={342.6} note="mean of 20 runs" winner />
+<TimeBar name="fd" value={342.6} max={342.6} note="mean of 20 runs" />
+
+Hyperfine summary:
+
+```text
+raid --glob '*' -H --skip-vfs / >/dev/null 2>/dev/null ran
+  1.98 ± 0.18 times faster than fd --hidden --no-ignore
+  --exclude proc --exclude sys --exclude dev --exclude run
+  . / >/dev/null 2>/dev/null
+```
+
+raid used:
+
+* **49.6% less wall time**
+* **80.7% less user CPU**
+* **49.2% less combined CPU time**
+
+The system CPU values were again nearly identical:
+
+```text
+raid: 960.4 ms
+fd:   957.2 ms
+```
+
+raid's slowest measured run was still much faster than fd's fastest:
+
+```text
+raid worst: 224.1 ms
+fd best:    328.3 ms
+```
+
+That does not make the outlier warning disappear, but it does make it considerably less exciting.
+
+<Note title="tiny fairness caveat">
+  `raid --skip-vfs` specifically skips the root virtual filesystem paths `/proc`, `/sys`, `/dev`, and `/run`. fd's basename excludes can also skip unrelated directories with those names elsewhere in the tree. The difference should be documented instead of swept underneath the nearest benchmark rug.
+</Note>
+
+<details>
+  <summary><strong>raw Hyperfine output</strong></summary>
+
+```text
+Benchmark 1: raid --glob '*' -H --skip-vfs / >/dev/null 2>/dev/null
+  Time (mean ± σ):     172.7 ms ±  12.7 ms    [User: 291.2 ms, System: 960.4 ms]
+  Range (min … max):   164.4 ms … 224.1 ms    20 runs
+
+  Warning: Ignoring non-zero exit code.
+  Warning: Statistical outliers were detected.
+
+Benchmark 2: fd --hidden --no-ignore \
+  --exclude proc --exclude sys --exclude dev --exclude run \
+  . / >/dev/null 2>/dev/null
+  Time (mean ± σ):     342.6 ms ±  17.4 ms    [User: 1505.7 ms, System: 957.2 ms]
+  Range (min … max):   328.3 ms … 410.6 ms    20 runs
+
+  Warning: Statistical outliers were detected.
+
+Summary
+  raid --glob '*' -H --skip-vfs / >/dev/null 2>/dev/null ran
+    1.98 ± 0.18 times faster than fd --hidden --no-ignore
+    --exclude proc --exclude sys --exclude dev --exclude run
+    . / >/dev/null 2>/dev/null
+```
+
+</details>
+
+## Result-count sanity check
+
+Before trusting the timing, both tools were also run with output passing through `wc`.
+
+Corrected commands:
+
+```bash
+time raid --glob '*' -H / | wc
+time fd --hidden --no-ignore . / | wc
+```
+
+Results:
+
+| Tool | Lines | Words | Bytes | Real time |
+| --- | ---: | ---: | ---: | ---: |
+| **raid** | **2,294,752** | **2,352,206** | **223,593,495** | **0.526 s** |
+| fd | 2,161,752 | 2,212,334 | 208,153,023 | 0.623 s |
+
+raid emitted:
+
+* **133,000 more paths**
+* about **6.15% more lines**
+* roughly **4.36 million paths per second**
+* fd emitted roughly **3.47 million paths per second**
+
+So raid was not winning by quietly returning half the filesystem and hoping nobody checked. In this run it printed more paths and still finished sooner.
+
+The counts do not have to match exactly. The tools have different traversal details, error behavior, path formatting, symlink behavior, and filtering semantics. The important thing is verifying that the faster tool is not accidentally doing dramatically less work.
+
+### why the first count comparison was wrong
+
+This is not equivalent:
+
+```bash
+raid . / -H
+fd . / -H
+```
+
+In raid, the default pattern is a literal substring. `.` means “the basename contains a period.”
+
+In fd, the default pattern is a regular expression. `.` means “any character.”
+
+One tool was looking for dots. The other released the entire filesystem.
+
+The corrected raid command uses:
+
+```bash
+raid --glob '*' -H /
+```
+
+which means what the benchmark actually needed: match everything.
+
+## Why raid is faster here
+
+raid's traversal core is aggressively boring.
+
+It does not build an index. It does not inspect `.gitignore`. It does not compile a regex for `*`. It does not build a rich result object for every path and send it through six tasteful abstractions.
+
+The main performance decisions are:
+
+1. **Direct Linux directory reads**
+
+   raid reads directory entries using `getdents64`.
+
+2. **Lazy metadata**
+
+   It only asks for `stat` data when a filter or output mode actually needs it.
+
+3. **Reused worker memory**
+
+   Path buffers, directory read buffers, metadata storage, and output buffers are reused.
+
+4. **Batched queue traffic**
+
+   Workers do not grab the shared queue mutex for every single discovered directory.
+
+5. **Buffered complete-record output**
+
+   Paths are emitted in chunks without allowing two workers to splice their filenames into one mutant path.
+
+6. **Simple matching paths**
+
+   Literal substring and glob matching avoid regex overhead when a regex is not needed.
+
+7. **Literal traversal defaults**
+
+   There is no project detection or ignore-file machinery in the traversal path.
+
+This does not prove raid will beat fd in every workload.
+
+fd has features raid intentionally does not copy, and those features cost something because computers continue to follow the deeply unfair law that doing more work requires doing more work.
+
+## What these benchmarks do not prove
+
+They do not prove that raid is:
+
+* always twice as fast
+* faster on every filesystem
+* faster on a cold HDD
+* faster for regex-heavy searches
+* faster when ignore files save fd from entering enormous build directories
+* more portable
+* a drop-in behavioral clone of fd
+* capable of making NTFS feel good on Linux
+* blessed by the filesystem benchmark pope
+
+A responsible claim is:
+
+> On this Exherbo Linux machine, during warm full-system traversal with hidden files enabled and output redirected to `/dev/null`, raid averaged 194.0 ms versus fd's 344.5 ms over 10 runs. When `/proc`, `/sys`, `/dev`, and `/run` were excluded, raid averaged 172.7 ms versus fd's 342.6 ms over 20 runs.
+
+An irresponsible claim is:
+
+> raid is universally twice as fast because Robert personally defeated directory traversal.
+
+Tempting. not scientifically ideal.
+
+## Reproducing the benchmark
+
+Build raid:
+
+```bash
+zig build-exe raid.zig -O ReleaseFast -lc -fstrip
+```
+
+Check versions:
+
+```bash
+raid --version
+fd --version
+hyperfine --version
+uname -a
+```
+
+Run the complete traversal test:
+
+```bash
+hyperfine --ignore-failure --warmup 3 --runs 10 \
+  "raid --glob '*' -H / >/dev/null 2>/dev/null" \
+  "fd --hidden --no-ignore . / >/dev/null 2>/dev/null"
+```
+
+Run the virtual-filesystem-excluded test:
+
+```bash
+hyperfine --ignore-failure --warmup 3 --runs 20 \
+  "raid --glob '*' -H --skip-vfs / >/dev/null 2>/dev/null" \
+  "fd --hidden --no-ignore \
+      --exclude proc --exclude sys --exclude dev --exclude run \
+      . / >/dev/null 2>/dev/null"
+```
+
+Check approximate output counts separately:
+
+```bash
+raid --glob '*' -H / | wc
+fd --hidden --no-ignore . / | wc
+```
+
+For ordinary filesystem roots with fewer weird kernel objects:
+
+```bash
+hyperfine --warmup 3 --runs 20 \
+  "raid --glob '*' -H /usr >/dev/null" \
+  "fd --hidden --no-ignore . /usr >/dev/null"
+```
+
+For traversal-only raid measurements:
+
+```bash
+raid --glob '*' -H --no-print --stats --time /
+```
+
+Do not compare `raid --no-print` with fd printing into `/dev/null`. `/dev/null` is fast, but formatting and writing millions of records is not free.
+
+## Current result
+
+<StatGrid>
+  <StatCard label="raid" value="172.7 ms">
+    20-run mean with virtual filesystems skipped.
+  </StatCard>
+  <StatCard label="fd" value="342.6 ms">
+    same general full-system workload.
+  </StatCard>
+  <StatCard label="speedup" value="1.98×">
+    approximately half the wall time.
+  </StatCard>
+  <StatCard label="scientific conclusion" value="bruh">
+    the rewrite is actually cooking.
+  </StatCard>
+</StatGrid>
+
+raid was written to kick the filesystem door in.
+
+apparently it also gets through the door before fd finishes checking whether the project has a `.gitignore`.
