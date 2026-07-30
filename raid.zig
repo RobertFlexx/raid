@@ -576,11 +576,11 @@ fn globMatches(pattern: []const u8, text: []const u8, insensitive: bool) bool {
             continue;
         }
 
-        if (star_pattern) |resume| {
+        if (star_pattern) |resume_index| {
             star_text += 1;
             if (star_text > text.len) return false;
             ti = star_text;
-            pi = resume;
+            pi = resume_index;
             continue;
         }
         return false;
@@ -649,13 +649,13 @@ fn typeCharFromMode(mode: c.mode_t) u8 {
 
 fn typeCharFromDirent(dtype: u8) u8 {
     return switch (dtype) {
-        c.DT_REG => 'f',
-        c.DT_DIR => 'd',
-        c.DT_LNK => 'l',
-        c.DT_BLK => 'b',
-        c.DT_CHR => 'c',
-        c.DT_FIFO => 'p',
-        c.DT_SOCK => 's',
+        8 => 'f',
+        4 => 'd',
+        10 => 'l',
+        6 => 'b',
+        2 => 'c',
+        1 => 'p',
+        12 => 's',
         else => '?',
     };
 }
@@ -801,7 +801,9 @@ fn modeString(mode: c.mode_t, type_char: u8) [10]u8 {
     };
     const bits = [_]c.mode_t{ 0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001 };
     const chars = "rwxrwxrwx";
-    for (bits, 0..) |bit, i| if ((mode & bit) != 0) out[i + 1] = chars[i];
+    for (bits, 0..) |bit, i| {
+        if ((mode & bit) != 0) out[i + 1] = chars[i];
+    }
     return out;
 }
 
@@ -992,7 +994,7 @@ fn processDirectory(ctx: *WorkerCtx, local: *WorkerLocal, task: *Task) !void {
                 break :read_loop;
             }
 
-            const entry: *const LinuxDirent64 = @ptrCast(@alignCast(read_buffer.ptr + offset));
+            const entry: *const LinuxDirent64 = @ptrCast(@alignCast(read_buffer[offset..].ptr));
             const record_len: usize = entry.d_reclen;
             const name_offset = @offsetOf(LinuxDirent64, "d_name");
             if (record_len <= name_offset or offset + record_len > count) {
@@ -1360,8 +1362,6 @@ fn usage(progname: []const u8, color: bool) void {
             reset,
             progname,
             progname,
-            bold,
-            reset,
             bold,
             reset,
             bold,
