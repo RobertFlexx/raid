@@ -1301,7 +1301,7 @@ fn usage(progname: []const u8, color: bool) void {
     const reset = if (color) "\x1b[0m" else "";
 
     std.debug.print(
-        "{s}raid{s} {s}— extremely fast parallel file search for Linux{s}\n\n" ++
+        "{s}raid{s}, {s}super fast low level file thingy for Linux{s}\n\n" ++
             "{s}USAGE{s}\n" ++
             "  {s} [OPTIONS] [PATTERN] [PATH ...]\n" ++
             "  {s} [OPTIONS] --path PATH [--path PATH ...] [PATTERN]\n\n" ++
